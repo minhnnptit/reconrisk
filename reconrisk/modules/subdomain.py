@@ -7,6 +7,8 @@ Sources:
   - amass (deep only — slow but thorough)
   - crt.sh (certificate transparency, no install needed)
   - DNS bruteforce fallback (if no tools)
+
+Go binary resolution: searches ~/go/bin/ directly to avoid PATH issues.
 """
 
 import os
@@ -21,15 +23,37 @@ from rich.console import Console
 console = Console()
 
 
-def _check_tool(name):
-    return shutil.which(name) is not None
+def _find_go_binary(name):
+    """
+    Tìm Go binary: ~/go/bin/ → GOPATH/bin/ → PATH.
+    Returns full path hoặc None.
+    """
+    # Check ~/go/bin/
+    home_bin = os.path.join(str(Path.home()), "go", "bin", name)
+    if os.path.isfile(home_bin) and os.access(home_bin, os.X_OK):
+        return home_bin
+
+    # Check GOPATH/bin/
+    try:
+        result = subprocess.run(
+            ["go", "env", "GOPATH"],
+            capture_output=True, text=True, timeout=5,
+        )
+        gopath = result.stdout.strip()
+        if gopath:
+            gopath_bin = os.path.join(gopath, "bin", name)
+            if os.path.isfile(gopath_bin) and os.access(gopath_bin, os.X_OK):
+                return gopath_bin
+    except Exception:
+        pass
+
+    # Check PATH
+    path = shutil.which(name)
+    return path
 
 
-def _run_subfinder(domain, depth, timeout):
-    """Chạy subfinder subprocess."""
-    cmd = ["subfinder", "-d", domain, "-silent"]
-    if depth == "deep":
-        cmd.extend(["-all", "-recursive"])
+def _run_tool(cmd, timeout):
+    """Run a subprocess and return stdout lines."""
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if result.returncode == 0:
@@ -39,40 +63,31 @@ def _run_subfinder(domain, depth, timeout):
         return []
 
 
-def _run_assetfinder(domain, timeout):
+def _run_subfinder(binary, domain, depth, timeout):
+    """Chạy subfinder subprocess."""
+    cmd = [binary, "-d", domain, "-silent"]
+    if depth == "deep":
+        cmd.extend(["-all", "-recursive"])
+    return _run_tool(cmd, timeout)
+
+
+def _run_assetfinder(binary, domain, timeout):
     """Chạy assetfinder subprocess."""
-    try:
-        result = subprocess.run(
-            ["assetfinder", "--subs-only", domain],
-            capture_output=True, text=True, timeout=timeout,
-        )
-        if result.returncode == 0:
-            return [l.strip() for l in result.stdout.strip().split("\n")
-                    if l.strip() and domain in l]
-        return []
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return []
+    subs = _run_tool([binary, "--subs-only", domain], timeout)
+    return [s for s in subs if domain in s]
 
 
-def _run_amass(domain, timeout):
+def _run_amass(binary, domain, timeout):
     """Chạy amass passive enum (deep mode only)."""
-    try:
-        result = subprocess.run(
-            ["amass", "enum", "-passive", "-d", domain],
-            capture_output=True, text=True,
-            timeout=timeout * 3,  # amass chạy lâu
-        )
-        if result.returncode == 0:
-            return [l.strip() for l in result.stdout.strip().split("\n")
-                    if l.strip() and domain in l]
-        return []
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        console.print("  [yellow]⚠ amass timed out or not found[/yellow]")
-        return []
+    subs = _run_tool(
+        [binary, "enum", "-passive", "-d", domain],
+        timeout * 3,  # amass chạy lâu
+    )
+    return [s for s in subs if domain in s]
 
 
 def _query_crtsh(domain, timeout):
-    """Query crt.sh (Certificate Transparency logs) — no install needed."""
+    """Query crt.sh (Certificate Transparency logs)."""
     try:
         resp = req.get(
             f"https://crt.sh/?q=%.{domain}&output=json",
@@ -84,7 +99,6 @@ def _query_crtsh(domain, timeout):
             subs = set()
             for entry in data:
                 name = entry.get("name_value", "")
-                # crt.sh may return wildcard or multi-line entries
                 for line in name.split("\n"):
                     line = line.strip().lower()
                     if line and not line.startswith("*") and domain in line:
@@ -144,24 +158,29 @@ def run_subdomain(config, results):
     output_dir = config["output_dir"]
 
     all_subs = set()
+    tool_count = 0
 
     # ─── Source 1: subfinder ─────────────────────────
-    has_subfinder = _check_tool("subfinder")
-    if has_subfinder:
+    subfinder = _find_go_binary("subfinder")
+    if subfinder:
         console.print(f"  [dim]Running subfinder ({depth} mode)...[/dim]")
-        subs = _run_subfinder(domain, depth, timeout)
+        subs = _run_subfinder(subfinder, domain, depth, timeout)
         console.print(f"  [dim]subfinder: {len(subs)} subdomains[/dim]")
         all_subs.update(subs)
+        tool_count += 1
     else:
-        console.print("  [yellow]⚠ subfinder not found[/yellow]")
+        console.print("  [dim]subfinder not installed (optional)[/dim]")
 
     # ─── Source 2: assetfinder ───────────────────────
-    has_assetfinder = _check_tool("assetfinder")
-    if has_assetfinder:
+    assetfinder = _find_go_binary("assetfinder")
+    if assetfinder:
         console.print("  [dim]Running assetfinder...[/dim]")
-        subs = _run_assetfinder(domain, timeout)
+        subs = _run_assetfinder(assetfinder, domain, timeout)
         console.print(f"  [dim]assetfinder: {len(subs)} subdomains[/dim]")
         all_subs.update(subs)
+        tool_count += 1
+    else:
+        console.print("  [dim]assetfinder not installed (optional)[/dim]")
 
     # ─── Source 3: crt.sh (always available) ─────────
     console.print("  [dim]Querying crt.sh (Certificate Transparency)...[/dim]")
@@ -170,14 +189,17 @@ def run_subdomain(config, results):
     all_subs.update(subs)
 
     # ─── Source 4: amass (deep only) ─────────────────
-    if depth == "deep" and _check_tool("amass"):
-        console.print("  [dim]Running amass (passive mode — may take a while)...[/dim]")
-        subs = _run_amass(domain, timeout)
-        console.print(f"  [dim]amass: {len(subs)} subdomains[/dim]")
-        all_subs.update(subs)
+    if depth == "deep":
+        amass = _find_go_binary("amass")
+        if amass:
+            console.print("  [dim]Running amass (passive mode — may take a while)...[/dim]")
+            subs = _run_amass(amass, domain, timeout)
+            console.print(f"  [dim]amass: {len(subs)} subdomains[/dim]")
+            all_subs.update(subs)
+            tool_count += 1
 
     # ─── Fallback: DNS bruteforce ────────────────────
-    if not has_subfinder and not has_assetfinder and len(all_subs) <= 1:
+    if tool_count == 0 and len(all_subs) <= 1:
         console.print("  [yellow]⚠ Few results, running DNS bruteforce...[/yellow]")
         subs = _dns_bruteforce(domain, timeout)
         all_subs.update(subs)

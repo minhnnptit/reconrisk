@@ -231,10 +231,15 @@ def _print_cve_detail_table(report):
     Print bảng chi tiết CVE cho tất cả hosts.
     Grouped by host, sorted by CVSS descending.
     """
-    # Collect all CVEs across hosts
+    # Collect all CVEs across hosts — deduplicate by CVE ID per host
     all_cves = []
+    seen_cves = set()
     for h in report["hosts"]:
         for cve in h.get("cves", []):
+            cve_key = f"{h['host']}:{cve.get('id', '')}"
+            if cve_key in seen_cves:
+                continue
+            seen_cves.add(cve_key)
             all_cves.append({
                 "host": h["host"],
                 **cve,
@@ -265,15 +270,17 @@ def _print_cve_detail_table(report):
 
     for cve in all_cves:
         cvss = cve.get("cvss", 0)
-        severity = cve.get("severity", "MEDIUM")
-
-        if severity == "CRITICAL":
+        # Calculate severity from CVSS (don't rely on cached field)
+        if cvss >= 9.0:
+            severity = "CRITICAL"
             cvss_str = f"[bold red]{cvss}[/bold red]"
             sev_str = f"[bold red]🔴 {severity}[/bold red]"
-        elif severity == "HIGH":
+        elif cvss >= 7.0:
+            severity = "HIGH"
             cvss_str = f"[yellow]{cvss}[/yellow]"
             sev_str = f"[yellow]🟠 {severity}[/yellow]"
         else:
+            severity = "MEDIUM"
             cvss_str = f"[dim]{cvss}[/dim]"
             sev_str = f"[dim]🟡 {severity}[/dim]"
 
