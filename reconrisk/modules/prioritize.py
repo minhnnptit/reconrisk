@@ -125,9 +125,13 @@ def run_prioritize(config, results):
     """
     subdomains = results.get("subdomain", [])
     dns_data = results.get("resolve", {})
+    root_domain = config.get("domain", "")
 
     if not subdomains:
         console.print("  [yellow]⚠ No subdomains to prioritize[/yellow]")
+        # Always return root domain as fallback
+        if root_domain:
+            return [{"subdomain": root_domain, "score": 10, "tags": ["root"], "ips": [], "cname": None}]
         return []
 
     # Detect wildcard
@@ -141,9 +145,25 @@ def run_prioritize(config, results):
     # Score each subdomain
     scored = []
     filtered_count = 0
+    root_included = False
 
     for sub in subdomains:
         score, tags = _score_subdomain(sub, dns_data)
+
+        # ALWAYS keep root domain (never filter it)
+        if sub == root_domain:
+            root_included = True
+            if score < 0:
+                score = 10
+                tags = ["root"]
+            scored.append({
+                "subdomain": sub,
+                "score": max(score, 10),
+                "tags": tags,
+                "ips": dns_data.get("hosts", {}).get(sub, {}).get("ips", []),
+                "cname": dns_data.get("hosts", {}).get(sub, {}).get("cname"),
+            })
+            continue
 
         # Filter dead
         if score < 0:
@@ -154,7 +174,6 @@ def run_prioritize(config, results):
         host_data = dns_data.get("hosts", {}).get(sub, {})
         ips = set(host_data.get("ips", []))
         if ips & wildcard_ips:
-            # Only keep if it has a high-value prefix
             if score < 20:
                 filtered_count += 1
                 continue
@@ -166,6 +185,10 @@ def run_prioritize(config, results):
             "ips": host_data.get("ips", []),
             "cname": host_data.get("cname"),
         })
+
+    # Safety: always include root domain
+    if not root_included and root_domain:
+        scored.append({"subdomain": root_domain, "score": 10, "tags": ["root"], "ips": [], "cname": None})
 
     # Sort by score descending
     scored.sort(key=lambda x: x["score"], reverse=True)

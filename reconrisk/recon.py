@@ -221,14 +221,13 @@ def run_pipeline(config):
         if phase == "report":
             continue
 
-        # Check dependencies
+        # Check dependencies — soft deps: warn but still try to run
         can_run, missing = check_phase_deps(phase, config["steps"], results)
         if not can_run:
             console.print(
-                f"  [yellow]⚠ Skipping [bold]{phase}[/bold]: "
-                f"missing deps: {', '.join(missing)}[/yellow]"
+                f"  [dim]⚠ deps incomplete: {', '.join(missing)} "
+                f"— running anyway with available data[/dim]"
             )
-            continue
 
         # Run phase
         console.print(f"\n[cyan]{'═' * 50}[/cyan]")

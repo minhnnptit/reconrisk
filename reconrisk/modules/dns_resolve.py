@@ -15,9 +15,10 @@ console = Console()
 
 
 def _resolve_host(subdomain):
-    """Resolve a subdomain to A records and check CNAME."""
+    """Resolve a subdomain to A records and check CNAME. Retry up to 3 times."""
     import dns.resolver
     import dns.name
+    import socket
 
     result = {
         "subdomain": subdomain,
@@ -26,37 +27,56 @@ def _resolve_host(subdomain):
         "resolved": False,
     }
 
-    resolver = dns.resolver.Resolver()
-    resolver.timeout = 5
-    resolver.lifetime = 5
+    # Try with increasing timeout (retry 3 times)
+    for attempt in range(3):
+        timeout = 5 + attempt * 5  # 5s, 10s, 15s
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = timeout
+        resolver.lifetime = timeout
 
-    # Check CNAME first
-    try:
-        answers = resolver.resolve(subdomain, "CNAME")
-        for rdata in answers:
-            cname_target = str(rdata.target).rstrip(".")
-            result["cname"] = cname_target
-    except Exception:
-        pass
+        # Check CNAME first
+        try:
+            answers = resolver.resolve(subdomain, "CNAME")
+            for rdata in answers:
+                cname_target = str(rdata.target).rstrip(".")
+                result["cname"] = cname_target
+        except Exception:
+            pass
 
-    # Resolve A records
-    try:
-        answers = resolver.resolve(subdomain, "A")
-        for rdata in answers:
-            result["ips"].append(str(rdata.address))
-        result["resolved"] = True
-    except Exception:
-        pass
-
-    # Resolve AAAA records
-    try:
-        answers = resolver.resolve(subdomain, "AAAA")
-        for rdata in answers:
-            result["ips"].append(str(rdata.address))
-        if result["ips"]:
+        # Resolve A records
+        try:
+            answers = resolver.resolve(subdomain, "A")
+            for rdata in answers:
+                result["ips"].append(str(rdata.address))
             result["resolved"] = True
-    except Exception:
-        pass
+        except Exception:
+            pass
+
+        # Resolve AAAA records
+        try:
+            answers = resolver.resolve(subdomain, "AAAA")
+            for rdata in answers:
+                result["ips"].append(str(rdata.address))
+            if result["ips"]:
+                result["resolved"] = True
+        except Exception:
+            pass
+
+        if result["resolved"]:
+            break  # success, no more retries
+
+    # Fallback: socket.getaddrinfo if dns.resolver failed
+    if not result["resolved"]:
+        try:
+            infos = socket.getaddrinfo(subdomain, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            for info in infos:
+                ip = info[4][0]
+                if ip not in result["ips"]:
+                    result["ips"].append(ip)
+            if result["ips"]:
+                result["resolved"] = True
+        except Exception:
+            pass
 
     return result
 
@@ -99,6 +119,11 @@ def run_dns_resolve(config, results):
         console.print("  [yellow]⚠ No subdomains to resolve[/yellow]")
         return {}
 
+    # Ensure root domain is always included
+    domain = config.get("domain", "")
+    if domain and domain not in subdomains:
+        subdomains = list(subdomains) + [domain]
+
     threads = config.get("threads", 10)
     output_dir = config["output_dir"]
 
@@ -109,6 +134,7 @@ def run_dns_resolve(config, results):
         "ip_map": {},      # IP → [subdomains]
         "unique_ips": [],
         "takeovers": [],   # potential subdomain takeovers
+        "domain": domain,  # root domain reference
     }
 
     resolved_count = 0
