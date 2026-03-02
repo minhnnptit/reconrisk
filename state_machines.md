@@ -1,12 +1,10 @@
-# ReconRisk — State Machines
+# ReconRisk v2 — State Machines
 
-Tài liệu này mô tả state machine cho từng thành phần của ReconRisk, giúp hiểu rõ luồng xử lý trước khi bắt tay vào code.
+Tài liệu mô tả state machine cho từng phase và interactive pipeline.
 
 ---
 
-## 1. Pipeline State Machine (Tổng thể)
-
-Điều khiển toàn bộ flow từ CLI → chạy từng phase → output.
+## 1. Pipeline State Machine (Tổng thể + Interactive)
 
 ```mermaid
 stateDiagram-v2
@@ -15,7 +13,8 @@ stateDiagram-v2
     ValidateArgs --> InitOutput : valid
     ValidateArgs --> ExitError : invalid
 
-    InitOutput --> BuildPhaseList
+    InitOutput --> PrintBanner
+    PrintBanner --> BuildPhaseList
     BuildPhaseList --> RunPhase
 
     state RunPhase {
@@ -23,19 +22,29 @@ stateDiagram-v2
         PickNextPhase --> CheckDeps : phase available
         PickNextPhase --> AllDone : no more phases
 
-        CheckDeps --> ExecutePhase : deps satisfied
-        CheckDeps --> SkipPhase : deps missing
-
+        CheckDeps --> ExecutePhase : deps ok or soft-skip
         ExecutePhase --> PhaseSuccess : ok
         ExecutePhase --> PhaseError : failed
 
         PhaseSuccess --> StoreResult
         PhaseError --> LogWarning
-        SkipPhase --> LogWarning
 
-        StoreResult --> PickNextPhase
+        StoreResult --> CheckInteractive
+        
+        state CheckInteractive {
+            [*] --> IsFlagSet
+            IsFlagSet --> IsPausePhase : -i set
+            IsFlagSet --> NoAction : no -i
+            IsPausePhase --> ShowTable : prioritize/probe/port
+            IsPausePhase --> NoAction : other phase
+            ShowTable --> UserSelect
+            UserSelect --> FilterResults
+            FilterResults --> [*]
+            NoAction --> [*]
+        }
+
+        CheckInteractive --> PickNextPhase
         LogWarning --> PickNextPhase
-
         AllDone --> [*]
     }
 
@@ -43,15 +52,15 @@ stateDiagram-v2
     GenerateReport --> SaveJSON
     SaveJSON --> PrintTable
     PrintTable --> [*]
-
     ExitError --> [*]
 ```
 
-### Giải thích
-- **ParseArgs** → **ValidateArgs**: Kiểm tra domain hợp lệ, steps/depth đúng format
-- **BuildPhaseList**: Từ `--steps` hoặc `--all`, xây danh sách phase theo thứ tự
-- **CheckDeps**: Ví dụ phase `risk` cần data từ `probe` + `cve`. Nếu user chỉ chạy `--steps risk`, skip vì thiếu input
-- **PhaseError → LogWarning**: Graceful degradation — không crash cả pipeline
+### Interactive Pauses
+| Pause | After Phase | Table Shows | User Selects |
+|-------|-------------|-------------|-------------|
+| 1 | prioritize | Score, subdomain, tags, IPs | By number, tag, or top N |
+| 2 | probe | Status, host, title, server, TLS | By number or top N |
+| 3 | port | Host, IP, open ports, OS | By number or top N |
 
 ---
 
@@ -59,437 +68,359 @@ stateDiagram-v2
 
 ```mermaid
 stateDiagram-v2
-    [*] --> CheckTools
+    [*] --> FindGoTools
 
-    state CheckTools {
-        [*] --> HasSubfinder
-        HasSubfinder --> HasAssetfinder : yes
-        HasSubfinder --> FallbackDNS : no
-        HasAssetfinder --> ToolsReady : yes
-        HasAssetfinder --> SubfinderOnly : no
+    state FindGoTools {
+        [*] --> SearchSubfinder : ~/go/bin + GOPATH + PATH
+        SearchSubfinder --> SearchAssetfinder
+        SearchAssetfinder --> [*]
     }
 
-    CheckTools --> RunEnum
+    FindGoTools --> RunSources
 
-    state RunEnum {
-        [*] --> CheckDepth
-        CheckDepth --> RunFast : depth=fast
-        CheckDepth --> RunDeep : depth=deep
+    state RunSources {
+        [*] --> CheckSubfinder
+        CheckSubfinder --> RunSubfinder : found
+        CheckSubfinder --> SkipSubfinder : not found
+        
+        RunSubfinder --> CheckAssetfinder
+        SkipSubfinder --> CheckAssetfinder
+        
+        CheckAssetfinder --> RunAssetfinder : found
+        CheckAssetfinder --> SkipAssetfinder : not found
+        
+        RunAssetfinder --> RunCrtsh
+        SkipAssetfinder --> RunCrtsh
+        
+        RunCrtsh --> ValidateCrtsh : clean garbage subdomains
+        ValidateCrtsh --> CheckDepth
+        
+        CheckDepth --> RunAmass : deep + amass found
+        CheckDepth --> CheckFallback : fast or no amass
+        
+        RunAmass --> CheckFallback
+        CheckFallback --> DNSBruteforce : no tools + few results
+        CheckFallback --> [*] : enough results
+        DNSBruteforce --> [*]
+    }
 
-        state RunFast {
-            [*] --> SubfinderDefault
-            SubfinderDefault --> AssetfinderRun
-            AssetfinderRun --> [*]
+    RunSources --> Deduplicate
+    Deduplicate --> SaveFile
+    SaveFile --> [*]
+```
+
+### Sources & Fallback
+| Source | Mode | Notes |
+|--------|------|-------|
+| subfinder | fast + deep | Searches ~/go/bin/ directly |
+| assetfinder | all | Optional, skipped if missing |
+| crt.sh | all | Always available, cleans garbage |
+| amass | deep only | Slow, passive enum |
+| DNS bruteforce | fallback | 53 prefixes if no tools found |
+
+---
+
+## 3. DNS Resolve Phase (`dns_resolve.py`)
+
+```mermaid
+stateDiagram-v2
+    [*] --> GetSubdomains
+    GetSubdomains --> EnsureRootDomain : always include root
+
+    EnsureRootDomain --> ResolveAll
+
+    state ResolveAll {
+        [*] --> PickSubdomain
+        PickSubdomain --> TryResolve : thread pool
+
+        state TryResolve {
+            [*] --> Attempt1 : timeout=5s
+            Attempt1 --> DNSSuccess : resolved
+            Attempt1 --> Attempt2 : failed, timeout=10s
+            Attempt2 --> DNSSuccess : resolved
+            Attempt2 --> Attempt3 : failed, timeout=15s
+            Attempt3 --> DNSSuccess : resolved
+            Attempt3 --> SocketFallback : all DNS failed
+            SocketFallback --> DNSSuccess : socket resolved
+            SocketFallback --> MarkDead : all failed
         }
 
-        state RunDeep {
-            [*] --> SubfinderLargeWordlist
-            SubfinderLargeWordlist --> [*]
-        }
+        DNSSuccess --> CheckCNAME
+        CheckCNAME --> CheckTakeover : has CNAME → check vuln patterns
+        CheckCNAME --> StoreResult : no CNAME
+        CheckTakeover --> StoreResult
+        MarkDead --> StoreResult
 
-        RunFast --> MergeResults
-        RunDeep --> MergeResults
+        StoreResult --> MoreSubs
+        MoreSubs --> PickSubdomain : yes
+        MoreSubs --> [*] : no
     }
 
-    state FallbackDNS {
-        [*] --> BruteResolve
-        BruteResolve --> [*]
-    }
-
-    RunEnum --> Deduplicate
-    FallbackDNS --> Deduplicate
-    Deduplicate --> SaveFile : subdomains.txt
-    SaveFile --> ReturnList
-    ReturnList --> [*]
-```
-
-### States chính
-| State | Mô tả |
-|-------|--------|
-| `CheckTools` | Kiểm tra subfinder/assetfinder có trong PATH |
-| `RunFast` | Chạy cả subfinder + assetfinder mặc định |
-| `RunDeep` | Subfinder với wordlist lớn |
-| `FallbackDNS` | Dùng dnspython nếu không có tool nào |
-| `Deduplicate` | Loại bỏ subdomain trùng lặp |
-
----
-
-## 3. HTTP Probe Phase (`http_probe.py`)
-
-```mermaid
-stateDiagram-v2
-    [*] --> CheckInput
-    CheckInput --> NoData : subdomains list trống
-    CheckInput --> CheckHttpx : có subdomains
-
-    NoData --> [*]
-
-    CheckHttpx --> UseHttpx : httpx available
-    CheckHttpx --> UseFallback : httpx missing
-
-    state UseHttpx {
-        [*] --> BuildCmd
-        BuildCmd --> CheckDepth
-        CheckDepth --> CmdFast : fast
-        CheckDepth --> CmdDeep : deep
-        CmdFast --> RunSubprocess
-        CmdDeep --> RunSubprocess
-        RunSubprocess --> ParseJSONLines
-        ParseJSONLines --> [*]
-    }
-
-    state UseFallback {
-        [*] --> InitThreadPool
-        InitThreadPool --> RequestsGet
-        RequestsGet --> CollectResults
-        CollectResults --> [*]
-    }
-
-    UseHttpx --> BuildProbeData
-    UseFallback --> BuildProbeData
-
-    BuildProbeData --> ReturnProbes
-    ReturnProbes --> [*]
-```
-
-### States chính
-| State | Mô tả |
-|-------|--------|
-| `CmdFast` | httpx: status, title, server |
-| `CmdDeep` | + follow redirects, HTTPS check, tech headers |
-| `UseFallback` | requests.get() với thread pool nếu thiếu httpx |
-| `BuildProbeData` | Chuẩn hóa output thành `{url, status, title, server}` |
-
----
-
-## 4. Port Scan Phase (`port_scan.py`)
-
-```mermaid
-stateDiagram-v2
-    [*] --> CheckNmap
-    CheckNmap --> NmapMissing : not found
-    CheckNmap --> ResolveTargets : found
-
-    NmapMissing --> WarnUser
-    WarnUser --> ReturnEmpty
-    ReturnEmpty --> [*]
-
-    ResolveTargets --> BuildNmapCmd
-
-    state BuildNmapCmd {
-        [*] --> CheckDepth
-        CheckDepth --> Fast : fast → top 100, -sV
-        CheckDepth --> Deep : deep → top 1000, -sV -O
-        Fast --> [*]
-        Deep --> [*]
-    }
-
-    BuildNmapCmd --> RunNmap
-    RunNmap --> NmapTimeout : timeout exceeded
-    RunNmap --> NmapSuccess : completed
-    RunNmap --> NmapError : error
-
-    NmapTimeout --> WarnUser
-    NmapError --> WarnUser
-
-    NmapSuccess --> ParseXML
-    ParseXML --> ExtractPorts
-    ExtractPorts --> ExtractServices
-    ExtractServices --> ExtractOS
-    ExtractOS --> ReturnPortData
-    ReturnPortData --> [*]
-```
-
-### States chính
-| State | Mô tả |
-|-------|--------|
-| `CheckNmap` | Kiểm tra nmap có trong PATH |
-| `Fast/Deep` | Top 100 vs top 1000 ports |
-| `ParseXML` | Parse nmap `-oX -` XML output |
-| `ExtractPorts/Services/OS` | Trích dữ liệu từ XML tree |
-
----
-
-## 5. CVE Lookup Phase (`cve_lookup.py`)
-
-```mermaid
-stateDiagram-v2
-    [*] --> CollectServices
-    CollectServices --> NoServices : không có service data
-    CollectServices --> HasServices : có services
-
-    NoServices --> ReturnEmpty
-    ReturnEmpty --> [*]
-
-    state HasServices {
-        [*] --> PickService
-        PickService --> CheckCache
-        CheckCache --> CacheHit : found in cache
-        CheckCache --> CacheMiss : not cached
-
-        CacheHit --> AddToResults
-
-        CacheMiss --> BuildQuery
-        BuildQuery --> RateLimit
-        RateLimit --> CallNVD
-
-        CallNVD --> APISuccess : 200 OK
-        CallNVD --> APIError : timeout / error
-        CallNVD --> RateLimited : 429
-
-        APISuccess --> ParseCVEs
-        ParseCVEs --> SaveToCache
-        SaveToCache --> AddToResults
-
-        APIError --> LogWarning
-        LogWarning --> AddToResults : empty CVE list
-
-        RateLimited --> WaitRetry
-        WaitRetry --> CallNVD
-
-        AddToResults --> MoreServices
-        MoreServices --> PickService : yes
-        MoreServices --> [*] : no
-    }
-
-    HasServices --> ReturnCVEData
-    ReturnCVEData --> [*]
-```
-
-### States chính
-| State | Mô tả |
-|-------|--------|
-| `CheckCache` | Xem `cve_cache.json`, tránh gọi API lại |
-| `RateLimit` | Sleep 0.6s (có key) hoặc 6s (không key) |
-| `CallNVD` | Gọi NVD API v2 keywordSearch |
-| `RateLimited` | Nhận 429 → chờ rồi retry |
-| `SaveToCache` | Lưu kết quả vào disk cache |
-
----
-
-## 6. Risk Score Phase (`risk_score.py`)
-
-```mermaid
-stateDiagram-v2
-    [*] --> CollectHostData
-
-    state CollectHostData {
-        [*] --> GatherProbe
-        GatherProbe --> GatherPorts
-        GatherPorts --> GatherCVEs
-        GatherCVEs --> [*]
-    }
-
-    CollectHostData --> ScoreHosts
-
-    state ScoreHosts {
-        [*] --> PickHost
-        PickHost --> InitScore : score = 0
-
-        InitScore --> CheckCriticalCVE
-        CheckCriticalCVE --> AddCVSS9Plus : CVSS >= 9.0 → +40
-        CheckCriticalCVE --> CheckHighCVE
-
-        AddCVSS9Plus --> CheckHighCVE
-        CheckHighCVE --> AddCVSS7Plus : CVSS 7-8.9 → +25
-        CheckHighCVE --> CheckMedCVE
-
-        AddCVSS7Plus --> CheckMedCVE
-        CheckMedCVE --> AddCVSSMed : CVSS 4-6.9 → +10 (max +20)
-        CheckMedCVE --> CheckPorts
-
-        AddCVSSMed --> CheckPorts
-        CheckPorts --> AddSensitive : 22,3306,5432... → +15
-        CheckPorts --> CheckAdminPorts
-
-        AddSensitive --> CheckAdminPorts
-        CheckAdminPorts --> AddAdmin : 8080,9000... → +10
-        CheckAdminPorts --> CheckHTTPS
-
-        AddAdmin --> CheckHTTPS
-        CheckHTTPS --> AddHTTPOnly : HTTP only → +10
-        CheckHTTPS --> ClampScore
-
-        AddHTTPOnly --> ClampScore
-        ClampScore --> AssignBand : cap 0-100
-
-        AssignBand --> MoreHosts
-        MoreHosts --> PickHost : yes
-        MoreHosts --> [*] : no
-    }
-
-    ScoreHosts --> SortByScore
-    SortByScore --> ReturnScored
-    ReturnScored --> [*]
-```
-
-### Risk Bands
-| Score | Band | Emoji |
-|-------|------|-------|
-| ≥ 70 | CRITICAL | 🔴 |
-| 50–69 | HIGH | 🟠 |
-| 30–49 | MEDIUM | 🟡 |
-| < 30 | LOW | 🟢 |
-
----
-
-## 7. Delta Phase (`delta.py`)
-
-```mermaid
-stateDiagram-v2
-    [*] --> CheckCompareFlag
-    CheckCompareFlag --> Skip : --compare not set
-    CheckCompareFlag --> LoadBaseline : --compare set
-
-    Skip --> [*]
-
-    LoadBaseline --> BaselineExists : file found
-    LoadBaseline --> NoBaseline : file not found
-
-    NoBaseline --> SaveAsBaseline : lưu scan hiện tại làm baseline
-    SaveAsBaseline --> PrintFirstRun : "Baseline saved, no diff"
-    PrintFirstRun --> [*]
-
-    BaselineExists --> ParseBaseline
-
-    state ComputeDiff {
-        [*] --> CompareHosts
-        CompareHosts --> FindNew : host mới xuất hiện
-        CompareHosts --> FindGone : host đã biến mất
-        CompareHosts --> FindChanged : cùng host, data khác
-
-        FindNew --> CollectChanges
-        FindGone --> CollectChanges
-        FindChanged --> CollectChanges
-
-        CollectChanges --> [*]
-    }
-
-    ParseBaseline --> ComputeDiff
-    ComputeDiff --> UpdateBaseline : ghi đè baseline mới
-    UpdateBaseline --> ReturnDelta
-    ReturnDelta --> [*]
-```
-
-### Delta output types
-| Tag | Ý nghĩa |
-|-----|---------|
-| `[NEW]` | Host/port/CVE mới xuất hiện |
-| `[GONE]` | Host/port đã offline |
-| `[CHANGED]` | Risk score thay đổi, CVE mới |
-
----
-
-## 8. Report Phase (`report.py`)
-
-```mermaid
-stateDiagram-v2
-    [*] --> CollectAllData
-
-    state CollectAllData {
-        [*] --> MergePhaseOutputs
-        MergePhaseOutputs --> HasDelta : --compare was used
-        MergePhaseOutputs --> NoDelta
-        HasDelta --> [*]
-        NoDelta --> [*]
-    }
-
-    CollectAllData --> BuildTable
-
-    state BuildTable {
-        [*] --> CreateRichTable
-        CreateRichTable --> AddColumns : Host, Status, Ports, CVE, Score, Band
-        AddColumns --> SortByRisk
-        SortByRisk --> CheckTopN
-        CheckTopN --> ApplyTopN : --top N set
-        CheckTopN --> ShowAll : no filter
-        ApplyTopN --> PopulateRows
-        ShowAll --> PopulateRows
-        PopulateRows --> ColorCode : band → color
-        ColorCode --> [*]
-    }
-
-    BuildTable --> PrintToTerminal
-
-    state PrintToTerminal {
-        [*] --> PrintScanTable
-        PrintScanTable --> CheckDelta
-        CheckDelta --> PrintDeltaSection : delta data exists
-        CheckDelta --> SkipDelta : no delta
-        PrintDeltaSection --> [*]
-        SkipDelta --> [*]
-    }
-
-    PrintToTerminal --> SaveJSON
+    ResolveAll --> BuildIPMap : IP → [subdomains]
+    BuildIPMap --> DeduplicateIPs
+    DeduplicateIPs --> SaveJSON
     SaveJSON --> [*]
 ```
 
 ---
 
-## 9. CLI Validation Flow (chi tiết `recon.py`)
+## 4. Prioritize Phase (`prioritize.py`)
 
 ```mermaid
 stateDiagram-v2
-    [*] --> ReadArgs : argparse
+    [*] --> GetSubdomains
+    GetSubdomains --> DetectWildcard : check if >50% same IP
 
-    ReadArgs --> ValidateDomain
-    ValidateDomain --> InvalidDomain : empty / bad format
-    ValidateDomain --> ValidateSteps : ok
+    DetectWildcard --> ScoreAll
 
-    InvalidDomain --> PrintHelp
-    PrintHelp --> [*]
+    state ScoreAll {
+        [*] --> PickSub
+        PickSub --> IsRootDomain
+        IsRootDomain --> AlwaysKeep : root domain → score ≥ 10
+        IsRootDomain --> CheckScore : not root
 
-    ValidateSteps --> InvalidStep : unknown step name
-    ValidateSteps --> ValidateDepth : ok
+        CheckScore --> ScorePrefix : dev/admin/api → +30-40
+        ScorePrefix --> ScoreCNAME : has CNAME → +25
+        ScoreCNAME --> ScoreIPUnique : unique IP → +20
+        ScoreIPUnique --> ScoreDepth : deep sub → +20
+        ScoreDepth --> CheckDead : not resolved → score -1
 
-    InvalidStep --> PrintHelp
+        CheckDead --> FilterDead : score < 0, not root
+        CheckDead --> FilterWildcard : wildcard IP + low score
+        CheckDead --> AddToList : passes all filters
+        
+        AlwaysKeep --> AddToList
+        FilterDead --> IncrementFiltered
+        FilterWildcard --> IncrementFiltered
+        
+        AddToList --> MoreSubs
+        IncrementFiltered --> MoreSubs
+        MoreSubs --> PickSub : yes
+        MoreSubs --> [*] : no
+    }
 
-    ValidateDepth --> InvalidDepth : not fast/deep
-    ValidateDepth --> ValidateOutput : ok
-
-    InvalidDepth --> PrintHelp
-
-    ValidateOutput --> CreateOutputDir
-    CreateOutputDir --> CheckThreads
-    CheckThreads --> CheckTimeout
-    CheckTimeout --> CheckNVDKey
-
-    CheckNVDKey --> ConfigReady
-    ConfigReady --> [*]
+    ScoreAll --> SortByScore
+    SortByScore --> [*]
 ```
 
 ---
 
-## Tổng kết Phase Dependencies
+## 5. HTTP Probe Phase (`http_probe.py`)
+
+```mermaid
+stateDiagram-v2
+    [*] --> GetInput
+    GetInput --> HandlePrioritized : list of dicts
+    GetInput --> HandleRaw : list of strings
+    HandlePrioritized --> ExtractSubdomains
+    HandleRaw --> ExtractSubdomains
+
+    ExtractSubdomains --> FindGoHttpx : ~/go/bin/httpx
+    FindGoHttpx --> UseGoHttpx : found
+    FindGoHttpx --> UseFallback : not found
+
+    UseGoHttpx --> ParseJSONLines --> BuildProbes
+    UseFallback --> ThreadPool --> RequestsGet --> BuildProbes
+
+    BuildProbes --> [*]
+```
+
+---
+
+## 6. Tech Detect Phase (`tech_detect.py`)
+
+```mermaid
+stateDiagram-v2
+    [*] --> GetAliveHosts
+
+    state AnalyzeHost {
+        [*] --> RunWhatweb : subprocess
+        RunWhatweb --> ParseJSON
+        ParseJSON --> AnalyzeHeaders : Server, X-Powered-By, Set-Cookie
+        AnalyzeHeaders --> AnalyzeBody : HTML patterns
+        AnalyzeBody --> MergeTech
+        MergeTech --> [*]
+    }
+
+    GetAliveHosts --> AnalyzeHost : per host
+    AnalyzeHost --> [*]
+```
+
+### Detection Sources
+| Source | Detects |
+|--------|---------|
+| whatweb | CMS, framework, server, language |
+| HTTP headers | Server, X-Powered-By, cookies |
+| HTML body | WordPress, Next.js, React, Angular |
+
+---
+
+## 7. Port Scan Phase (`port_scan.py`)
+
+```mermaid
+stateDiagram-v2
+    [*] --> GetTargets
+    GetTargets --> UseUniqueIPs : from resolve phase
+    GetTargets --> UseSubdomains : fallback
+
+    UseUniqueIPs --> LimitTargets : max 50
+    UseSubdomains --> LimitTargets
+
+    LimitTargets --> BuildNmapCmd
+    BuildNmapCmd --> NmapFast : fast → top 100, -sV
+    BuildNmapCmd --> NmapDeep : deep → top 1000, -sV -O
+
+    NmapFast --> RunNmap
+    NmapDeep --> RunNmap
+    RunNmap --> ParseXML --> ExtractPorts --> [*]
+```
+
+---
+
+## 8. Web Fuzz Phase (`web_fuzz.py`)
+
+```mermaid
+stateDiagram-v2
+    [*] --> FilterHosts : only 200/301/401/403
+
+    FilterHosts --> LimitHosts : fast=20, deep=50
+    LimitHosts --> GetWordlist
+
+    state FuzzHost {
+        [*] --> CheckFfuf
+        CheckFfuf --> RunFfuf : found
+        CheckFfuf --> RunFallback : not found
+        RunFfuf --> ParseJSON
+        RunFallback --> RequestsBrute
+        ParseJSON --> ClassifyPaths
+        RequestsBrute --> ClassifyPaths
+        ClassifyPaths --> AutoFlag : admin/config/backup
+        AutoFlag --> [*]
+    }
+
+    GetWordlist --> FuzzHost : per host, max 60s
+    FuzzHost --> [*]
+```
+
+---
+
+## 9. CVE Lookup Phase (`cve_lookup.py`)
+
+```mermaid
+stateDiagram-v2
+    [*] --> CollectServices : from port + tech
+
+    state LookupLoop {
+        [*] --> PickService
+        PickService --> CheckCache
+        CheckCache --> CacheHit : return cached
+        CheckCache --> CallNVD : query API
+        CallNVD --> Success : parse CVEs
+        CallNVD --> RateLimited : 429 → retry
+        CallNVD --> Error : timeout → skip
+        Success --> SaveCache
+        SaveCache --> MoreServices
+        CacheHit --> MoreServices
+        Error --> MoreServices
+        MoreServices --> PickService : yes
+        MoreServices --> [*] : no
+    }
+
+    CollectServices --> LookupLoop
+    LookupLoop --> [*]
+```
+
+---
+
+## 10. Param Find Phase (`param_find.py`)
+
+```mermaid
+stateDiagram-v2
+    [*] --> GetAliveHosts
+
+    state ScanHost {
+        [*] --> RunArjun : subprocess, timeout
+        RunArjun --> ParseOutput
+        RunArjun --> Timeout : skip host
+        ParseOutput --> ClassifyParams
+        ClassifyParams --> FlagDangerous : SSRF/LFI/RCE/IDOR
+        FlagDangerous --> [*]
+        Timeout --> [*]
+    }
+
+    GetAliveHosts --> ScanHost : per host
+    ScanHost --> [*]
+```
+
+---
+
+## 11. Risk Score Phase (`risk_score.py`)
+
+```mermaid
+stateDiagram-v2
+    [*] --> CollectAllData : probe + port + cve + fuzz + param + dns
+
+    state ScoreHost {
+        [*] --> CVEScore : critical/high/medium
+        CVEScore --> PortScore : sensitive + admin ports
+        PortScore --> HTTPSCheck : HTTP only → +10
+        HTTPSCheck --> FuzzScore : config leak/admin/backup
+        FuzzScore --> ParamScore : SSRF/LFI/RCE params
+        ParamScore --> TakeoverScore : CNAME takeover
+        TakeoverScore --> Clamp : 0-100
+        Clamp --> AssignBand : CRITICAL/HIGH/MEDIUM/LOW
+        AssignBand --> [*]
+    }
+
+    CollectAllData --> ScoreHost : per host
+    ScoreHost --> SortByScore
+    SortByScore --> [*]
+```
+
+---
+
+## 12. Phase Dependencies (v2)
 
 ```mermaid
 graph LR
-    subgraph Input
-        CLI["CLI Args"]
-    end
-
-    subgraph Phases
+    subgraph "Recon Pipeline v2"
         SD["1. Subdomain"]
-        PR["2. Probe"]
-        PS["3. Port Scan"]
-        CV["4. CVE Lookup"]
-        RS["5. Risk Score"]
-        DL["6. Delta"]
-        RP["7. Report"]
+        RS["2. Resolve"]
+        PR["3. Prioritize"]
+        PB["4. Probe"]
+        TD["5. TechDetect"]
+        PS["6. Port"]
+        FZ["7. Fuzz"]
+        CV["8. CVE"]
+        PF["9. ParamFind"]
+        RK["10. Risk"]
+        DL["11. Delta"]
+        RP["12. Report"]
     end
 
-    CLI --> SD
-    SD --> PR
-    SD --> PS
-    PR --> CV
+    SD --> RS
+    RS --> PR
+    PR --> PB
+    PB --> TD
+    RS --> PS
+    PB --> FZ
     PS --> CV
-    PR --> RS
-    PS --> RS
-    CV --> RS
-    RS --> DL
-    RS --> RP
+    TD --> CV
+    PB --> PF
+    PB --> RK
+    PS --> RK
+    CV --> RK
+    FZ --> RK
+    PF --> RK
+    RK --> DL
+    RK --> RP
     DL --> RP
+
+    style PR fill:#ff6,stroke:#333
+    style PB fill:#6f6,stroke:#333
+    style PS fill:#ff6,stroke:#333
 ```
 
 > [!IMPORTANT]
-> Mỗi phase có thể chạy độc lập nếu user cung cấp `--steps` cụ thể, nhưng nếu thiếu data từ phase trước thì sẽ **skip** thay vì crash.
+> Phases có viền vàng/xanh là **interactive pause points** khi dùng `-i`.
+> Dependencies là **soft** — phase vẫn chạy nếu deps thiếu data.

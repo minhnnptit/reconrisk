@@ -15,11 +15,15 @@ import os
 import re
 import subprocess
 import shutil
+import warnings
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from rich.console import Console
+
+# Suppress InsecureRequestWarning (we intentionally use verify=False)
+warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
 console = Console()
 

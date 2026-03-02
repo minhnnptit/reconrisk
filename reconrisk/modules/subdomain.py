@@ -95,13 +95,36 @@ def _query_crtsh(domain, timeout):
             headers={"User-Agent": "ReconRisk/1.0"},
         )
         if resp.status_code == 200:
+            import re
             data = resp.json()
             subs = set()
             for entry in data:
                 name = entry.get("name_value", "")
                 for line in name.split("\n"):
                     line = line.strip().lower()
-                    if line and not line.startswith("*") and domain in line:
+                    if not line or line.startswith("*"):
+                        continue
+                    if domain not in line:
+                        continue
+                    # Validate: must end with domain and contain only valid chars
+                    if not line.endswith(domain):
+                        continue
+                    # Reject garbage: "xxx.comwww.domain.com" 
+                    # Valid subdomain chars: alphanumeric, hyphen, dots
+                    if not re.match(r'^[a-z0-9]([a-z0-9\-\.]*[a-z0-9])?$', line):
+                        continue
+                    # Reject if any label has >63 chars or contains ".com" mid-string
+                    labels = line.split(".")
+                    garbage = False
+                    for label in labels:
+                        if len(label) > 63:
+                            garbage = True
+                            break
+                        # Detect merged domains like "xxx.comwww"
+                        if "com" in label and label != "com" and len(label) > 5:
+                            garbage = True
+                            break
+                    if not garbage:
                         subs.add(line)
             return list(subs)
         return []

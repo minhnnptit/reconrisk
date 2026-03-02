@@ -232,7 +232,22 @@ def run_web_fuzz(config, results):
         return []
 
     depth = config.get("depth", "fast")
-    timeout = config.get("timeout", 120)
+    timeout = min(config.get("timeout", 120), 60)  # max 60s per host
+
+    # Filter: only fuzz hosts with useful status (skip 503/5xx/timeout)
+    fuzzable = [
+        p for p in probes
+        if p.get("status", 0) in (200, 201, 301, 302, 307, 401, 403)
+    ]
+    if not fuzzable:
+        console.print("  [yellow]⚠ No hosts with fuzzable status (200/301/401/403)[/yellow]")
+        return []
+
+    # Limit max hosts to fuzz (avoid scanning 90+ hosts)
+    max_fuzz = 50 if depth == "deep" else 20
+    if len(fuzzable) > max_fuzz:
+        console.print(f"  [dim]Limiting to top {max_fuzz} hosts (total: {len(fuzzable)})[/dim]")
+        fuzzable = fuzzable[:max_fuzz]
 
     # Get wordlist
     wordlist = _get_wordlist(depth)
@@ -244,12 +259,12 @@ def run_web_fuzz(config, results):
     use_ffuf = shutil.which("ffuf") is not None
     tool_name = "ffuf" if use_ffuf else "requests"
     console.print(f"  [dim]Using {tool_name}, wordlist: {os.path.basename(wordlist)}[/dim]")
-    console.print(f"  [dim]Fuzzing {len(probes)} hosts...[/dim]")
+    console.print(f"  [dim]Fuzzing {len(fuzzable)} hosts (filtered from {len(probes)} alive)...[/dim]")
 
     fuzz_results = []
-    for i, probe in enumerate(probes):
+    for i, probe in enumerate(fuzzable):
         host = probe.get("host", "")
-        console.print(f"  [{i+1}/{len(probes)}] [dim]{host}...[/dim]", end="")
+        console.print(f"  [{i+1}/{len(fuzzable)}] [dim]{host}...[/dim]", end="")
 
         result = _fuzz_single_host(probe, wordlist, use_ffuf, timeout)
         fuzz_results.append(result)
