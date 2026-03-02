@@ -24,6 +24,25 @@ def _check_tool(name):
     return shutil.which(name) is not None
 
 
+def _is_projectdiscovery_httpx():
+    """
+    Verify httpx là ProjectDiscovery httpx (Go binary),
+    không phải Python httpx package mà Kali có sẵn.
+    """
+    try:
+        result = subprocess.run(
+            ["httpx", "-version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        output = (result.stdout + result.stderr).lower()
+        # ProjectDiscovery httpx in ra "projectdiscovery" hoặc version format "x.x.x"
+        return "projectdiscovery" in output or "current version" in output
+    except Exception:
+        return False
+
+
 def _run_httpx(subdomains, depth, timeout):
     """
     Chạy httpx subprocess, parse JSON output.
@@ -166,7 +185,7 @@ def run_probe(config, results):
 
     console.print(f"  [dim]Probing {len(subdomains)} subdomains...[/dim]")
 
-    has_httpx = _check_tool("httpx")
+    has_httpx = _check_tool("httpx") and _is_projectdiscovery_httpx()
 
     if has_httpx:
         console.print(f"  [dim]Using httpx ({depth} mode)...[/dim]")
@@ -175,6 +194,8 @@ def run_probe(config, results):
             console.print(f"  [green]✓ httpx found {len(probes)} alive hosts[/green]")
             return probes
         console.print("  [yellow]⚠ httpx returned no results, falling back to requests[/yellow]")
+    elif _check_tool("httpx"):
+        console.print("  [yellow]⚠ httpx found but is NOT ProjectDiscovery httpx — using requests fallback[/yellow]")
 
     # Fallback
     probes = _fallback_probe(subdomains, threads, timeout)

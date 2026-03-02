@@ -60,17 +60,38 @@ echo -e "\n${YELLOW}[3/4] Python dependencies...${NC}"
 pip3 install -r requirements.txt -q
 echo -e "${GREEN}  ✓ Python packages installed${NC}"
 
-# ─── PATH reminder ───────────────────────────────────
-echo -e "\n${YELLOW}[4/4] PATH check...${NC}"
+# ─── PATH persistence ────────────────────────────────
+echo -e "\n${YELLOW}[4/4] PATH setup...${NC}"
 GOBIN=$(go env GOPATH)/bin
+PATH_LINE="export PATH=\$PATH:$GOBIN"
 
-if [[ ":$PATH:" != *":$GOBIN:"* ]]; then
-    echo -e "${YELLOW}  ⚠ Add Go bin to your PATH:${NC}"
-    echo -e "    export PATH=\$PATH:$GOBIN"
-    echo -e "  ${CYAN}Or add this to your ~/.bashrc / ~/.zshrc${NC}"
-else
-    echo -e "${GREEN}  ✓ Go bin already in PATH${NC}"
+# Auto-add to .bashrc if not present
+if [ -f "$HOME/.bashrc" ]; then
+    if ! grep -q "$(go env GOPATH)/bin" "$HOME/.bashrc" 2>/dev/null; then
+        echo "" >> "$HOME/.bashrc"
+        echo "# ReconRisk: Go tools PATH" >> "$HOME/.bashrc"
+        echo "$PATH_LINE" >> "$HOME/.bashrc"
+        echo -e "${GREEN}  ✓ Added Go bin to ~/.bashrc${NC}"
+    else
+        echo -e "${GREEN}  ✓ Go bin already in ~/.bashrc${NC}"
+    fi
 fi
+
+# Also add to .zshrc if it exists
+if [ -f "$HOME/.zshrc" ]; then
+    if ! grep -q "$(go env GOPATH)/bin" "$HOME/.zshrc" 2>/dev/null; then
+        echo "" >> "$HOME/.zshrc"
+        echo "# ReconRisk: Go tools PATH" >> "$HOME/.zshrc"
+        echo "$PATH_LINE" >> "$HOME/.zshrc"
+        echo -e "${GREEN}  ✓ Added Go bin to ~/.zshrc${NC}"
+    else
+        echo -e "${GREEN}  ✓ Go bin already in ~/.zshrc${NC}"
+    fi
+fi
+
+# Apply for current session
+export PATH=$PATH:$GOBIN
+echo -e "${CYAN}  ℹ Run: source ~/.bashrc (or restart terminal) to use Go tools${NC}"
 
 # ─── Verify ──────────────────────────────────────────
 echo -e "\n${CYAN}═══════════════════════════════════════${NC}"

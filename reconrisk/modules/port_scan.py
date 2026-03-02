@@ -21,7 +21,7 @@ def _check_tool(name):
 
 def _build_nmap_cmd(targets, depth, timeout):
     """Build nmap command based on depth."""
-    cmd = ["nmap"]
+    cmd = ["nmap", "-Pn"]  # -Pn: skip host discovery (fix cho VM/firewall)
 
     if depth == "fast":
         cmd.extend(["-T4", "--top-ports", "100", "-sV"])
