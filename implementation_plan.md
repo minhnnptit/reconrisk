@@ -1,27 +1,60 @@
-# ReconRisk — Modular Recon CLI (Terminal Prototype)
+# ReconRisk v2 — Implementation Plan
 
 ## Core Concept
 
-Standard recon tools chạy tất cả mọi thứ theo kiểu "hộp đen". **ReconRisk** cho phép bạn chọn đúng phase cần chạy, ở độ sâu cần thiết — và **phát hiện thay đổi bề mặt tấn công** giữa các lần scan. Phù hợp với workflow pentest định kỳ.
+Standard recon tools chạy tất cả theo kiểu "hộp đen". **ReconRisk** cho phép:
+- **Chọn phase** cần chạy (`--steps`)
+- **Chọn độ sâu** per phase (`--depth fast|deep`)
+- **Chọn target** tại 3 điểm pause (`-i` interactive mode)
+- **Phát hiện thay đổi** bề mặt tấn công giữa các lần scan (`--compare`)
 
 ```
-[Quick check]    python3 recon.py -d target.com --steps subdomain,probe
-[Deep dive]      python3 recon.py -d target.com --steps subdomain,port,cve --depth deep
-[Full + diff]    python3 recon.py -d target.com --all --compare
+[Quick scan]     python3 recon.py -d target.com --all --depth fast
+[Deep + select]  python3 recon.py -d target.com --all --depth deep -i
+[Delta diff]     python3 recon.py -d target.com --all --compare
 ```
 
 ---
 
 ## What Makes This Different
 
-| Feature                   | Standard tools | ReconRisk       |
-|---------------------------|----------------|-----------------|
-| Chọn phase chạy           | ✗              | ✅ `--steps`    |
-| Fast / Deep per phase     | ✗              | ✅ `--depth`    |
-| CVE enrichment (NVD API)  | ✗              | ✅              |
-| Risk score per host       | ✗              | ✅ 0–100        |
-| **Delta so sánh 2 scan**  | ✗              | ✅ `--compare`  |
-| Output                    | Log, file      | Terminal table  |
+| Feature | Standard tools | ReconRisk |
+|---------|---------------|-----------|
+| Chọn phase chạy | ✗ | ✅ `--steps` |
+| Fast / Deep per phase | ✗ | ✅ `--depth` |
+| Interactive target selection | ✗ | ✅ `-i` (3 pause points) |
+| CVE enrichment (NVD API) | ✗ | ✅ auto-query |
+| Tech stack detection | ✗ | ✅ whatweb + headers |
+| Directory fuzzing + auto-flag | ✗ | ✅ admin/config/backup |
+| Parameter discovery + danger flags | ✗ | ✅ SSRF/LFI/RCE |
+| Risk score per host | ✗ | ✅ 0–100 composite |
+| Delta so sánh 2 scan | ✗ | ✅ `--compare` |
+| Smart subdomain scoring | ✗ | ✅ 30+ patterns |
+
+---
+
+## Pipeline — 12 Phases
+
+```
+subdomain → resolve → prioritize → [PAUSE 1] → probe → [PAUSE 2]
+→ techdetect → port → [PAUSE 3] → fuzz → cve → paramfind
+→ risk → delta → report
+```
+
+| # | Phase | Tool | Fast vs Deep |
+|---|-------|------|-------------|
+| 1 | subdomain | subfinder + assetfinder + crt.sh + amass | fast: 2 tools / deep: +amass |
+| 2 | resolve | dnspython (retry 3x) + socket fallback | Same |
+| 3 | prioritize | Scoring engine (v2.1) | Same |
+| 4 | probe | httpx (Go) / requests | Same |
+| 5 | techdetect | whatweb + header/body analysis | Same |
+| 6 | port | nmap | fast: top 100 / deep: top 1000 + OS |
+| 7 | fuzz | ffuf / requests | fast: small.txt, 20 hosts / deep: large.txt, 50 hosts |
+| 8 | cve | NVD API v2 + cache | Same |
+| 9 | paramfind | arjun → temp JSON | fast: 10 hosts / deep: 25 hosts |
+| 10 | risk | Pure computation, 0-100 | Same |
+| 11 | delta | Baseline diff | Same |
+| 12 | report | Rich tables + JSON | Same |
 
 ---
 
@@ -31,282 +64,199 @@ Standard recon tools chạy tất cả mọi thứ theo kiểu "hộp đen". **R
 python3 recon.py [OPTIONS]
 
 Required:
-  -d, --domain      Target domain
+  -d, --domain         Target domain
 
 Scope:
-  --steps           Comma-separated: subdomain, probe, port, cve, risk, delta
-                    Default: all steps
-  --all             Shorthand: chạy tất cả phase
+  --all                Run all 12 phases
+  --steps p1,p2,...    Chọn phases cụ thể (comma-separated)
 
 Depth:
-  --depth           fast | deep  (default: fast)
+  --depth fast|deep    Mức độ quét (default: fast)
 
-  fast:  subfinder + assetfinder  |  top 100 ports  |  CVE từ server header
-  deep:  subfinder wordlist lớn   |  top 1000 ports  |  CVE từ service version đầy đủ
+Interactive:
+  -i, --interactive    Pause tại 3 điểm để user chọn targets
 
 Delta:
-  --compare         So sánh với lần scan trước (baseline.json)
-                    Lần đầu: tự động lưu baseline
-                    Lần sau: in diff (NEW / GONE / CHANGED)
+  --compare            So sánh với lần scan trước (baseline.json)
 
 Output:
-  -o, --output      Thư mục lưu kết quả (default: ./results/<domain>/)
-  --top N           Chỉ hiện top-N host rủi ro nhất trên terminal
+  -o, --output         Thư mục lưu kết quả (default: ./results/<domain>/)
+  --top N              Chỉ hiện top-N host rủi ro nhất
 
-Misc:
-  --threads         Concurrency (default: 10)
-  --timeout         Timeout mỗi phase (seconds, default: 120)
-  --no-cache        Tắt CVE cache
-  --nvd-key         NVD API key (optional, tăng rate limit)
+Performance:
+  --threads N          Concurrency (default: 10)
+  --timeout N          Timeout mỗi phase (default: 120s)
+
+CVE:
+  --no-cache           Tắt CVE cache
+  --nvd-key KEY        NVD API key (nhanh hơn 10x)
 ```
 
 ### Usage Examples
 
 ```bash
-# Chỉ enum subdomain
-python3 recon.py -d example.com --steps subdomain
+# Quick scan
+python3 recon.py -d example.com --all --depth fast
 
-# Subdomain → alive check → risk score
-python3 recon.py -d example.com --steps subdomain,probe,risk
+# Deep scan với interactive selection
+python3 recon.py -d example.com --all --depth deep -i
 
-# Full scan, deep mode, top 10 rủi ro nhất
-python3 recon.py -d example.com --all --depth deep --top 10
+# Chỉ chạy vài phases
+python3 recon.py -d example.com --steps subdomain,resolve,prioritize,probe
 
-# Full scan + so sánh với lần scan trước
+# Full scan + delta comparison
 python3 recon.py -d example.com --all --compare
 
-# Skip thẳng vào CVE + risk (biết host rồi)
-python3 recon.py -d example.com --steps cve,risk --depth deep
+# Top 5 riskiest hosts
+python3 recon.py -d example.com --all --top 5
 ```
 
 ---
 
-## Prerequisites & Environment (Linux)
+## Interactive Mode — 3 Pause Points
 
-```bash
-# Ubuntu/Debian system deps
-sudo apt-get install -y nmap python3 python3-pip golang-go
-
-# Go tools
-go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-go install -v github.com/tomnomnom/assetfinder@latest
-
-# Thêm Go bin vào PATH
-export PATH=$PATH:$(go env GOPATH)/bin
-
-# Python deps
-pip3 install -r requirements.txt
 ```
-
-> [!NOTE]
-> `amass` bị loại khỏi prototype vì cài nặng và chậm. `--depth deep` dùng subfinder với wordlist lớn hơn thay thế.
+subdomain → resolve → prioritize
+  ╔══════════════════════════════════════════════════╗
+  ║  PAUSE 1: Select subdomains                     ║
+  ║  Table: #, Score, Subdomain, Tags, IPs          ║
+  ║  Input: all | 1-5,8 | high-value | top 10       ║
+  ╚══════════════════════════════════════════════════╝
+→ probe
+  ╔══════════════════════════════════════════════════╗
+  ║  PAUSE 2: Select alive hosts                    ║
+  ║  Table: #, Status, Host, Title, Server, TLS     ║
+  ║  Input: all | 1-5,8 | top 10                    ║
+  ╚══════════════════════════════════════════════════╝
+→ techdetect → port
+  ╔══════════════════════════════════════════════════╗
+  ║  PAUSE 3: Select by port/service                ║
+  ║  Table: #, Host, IP, Open Ports, OS             ║
+  ║  Input: all | 1-3,5 | top 5                     ║
+  ╚══════════════════════════════════════════════════╝
+→ fuzz → cve → paramfind → risk → delta → report
+```
 
 ---
 
 ## File Structure
 
 ```
-reconrisk/
-├── recon.py                ← CLI entry point (argparse + pipeline)
-├── requirements.txt        ← rich, requests, dnspython
-├── setup.sh                ← Script tự động cài Go tools (Linux)
-├── README.md
-├── modules/
-│   ├── __init__.py         ← Phase registry: PHASES list
-│   ├── subdomain.py        ← subfinder + assetfinder (subprocess)
-│   ├── http_probe.py       ← httpx subprocess + requests fallback
-│   ├── port_scan.py        ← nmap -oX stdout, parse xml.etree
-│   ├── cve_lookup.py       ← NVD API v2 + disk cache JSON
-│   ├── risk_score.py       ← pure function, no I/O
-│   ├── delta.py            ← baseline load/save/diff
-│   └── report.py           ← rich table + JSON dump
-└── results/
-    └── <domain>/
+Mini_Recon/
+├── c01.md                      ← Challenge brief
+├── implementation_plan.md      ← This file
+├── state_machines.md           ← State machine diagrams (Mermaid)
+├── phase_reference.md          ← Detailed phase reference guide
+│
+└── reconrisk/
+    ├── recon.py                ← CLI + 12-phase pipeline + interactive UI
+    ├── requirements.txt        ← rich, requests, dnspython
+    ├── setup.sh                ← Auto-install script (Linux/Kali)
+    ├── README.md               ← User-facing quick start guide
+    │
+    ├── modules/
+    │   ├── __init__.py         ← Phase registry + dependency map
+    │   ├── subdomain.py        ← subfinder + assetfinder + amass + crt.sh
+    │   ├── dns_resolve.py      ← DNS resolve (retry 3x + socket fallback)
+    │   ├── prioritize.py       ← Scoring v2.1 (positive + negative patterns)
+    │   ├── http_probe.py       ← httpx (Go) / requests probe
+    │   ├── tech_detect.py      ← whatweb + header/body tech detection
+    │   ├── port_scan.py        ← nmap XML parsing (top 100/1000)
+    │   ├── web_fuzz.py         ← ffuf + auto-flag (admin/config/backup)
+    │   ├── cve_lookup.py       ← NVD API v2 + disk cache + dedup
+    │   ├── param_find.py       ← arjun → temp JSON + danger flags
+    │   ├── risk_score.py       ← 0-100 composite scoring
+    │   ├── delta.py            ← Baseline load/save/diff
+    │   └── report.py           ← Rich tables + JSON export
+    │
+    ├── wordlists/
+    │   └── dirs_small.txt      ← Security-focused paths (~120)
+    │
+    └── results/<domain>/
         ├── subdomains.txt
+        ├── dns_map.json
+        ├── fuzz_results.json
+        ├── params.json
         ├── report.json
         └── baseline.json
 ```
 
 ---
 
-## Phase Details
+## Resilience Design
 
-### Phase 1 — Subdomain Enum (`subdomain`)
+### Soft Dependencies
+Phases chạy khi deps thiếu data — warn nhưng không skip.
 
-| Mode   | Tools                            | ~Time    |
-|--------|----------------------------------|----------|
-| `fast` | subfinder + assetfinder          | 15–30s   |
-| `deep` | subfinder với wordlist lớn hơn   | 1–2 min  |
+### DNS Resilience
+- Retry 3x (5s → 10s → 15s timeout)
+- Socket fallback nếu dnspython fail
+- Root domain luôn được giữ
 
-- Chạy bằng `subprocess.run()`, deduplicate output
-- Fallback: `dnspython` brute resolve nếu thiếu subfinder
-- Output: `subdomains.txt`
+### Smart Filtering
+| Module | Filter |
+|--------|--------|
+| crt.sh | Reject garbage (`xxx.comwww`), validate labels |
+| prioritize | Negative scoring CDN/S3/static, filter score ≤ 0 |
+| probe | Suppress InsecureRequestWarning |
+| fuzz | Only status 200/301/401/403, limit 20/50 hosts, 60s/host |
+| paramfind | Only status 200/301/401/403, limit 10/25 hosts, 60-90s/host |
+| CVE | Dedup by host+CVE ID, severity from CVSS (not cache) |
 
----
+### Graceful Degradation
 
-### Phase 2 — HTTP Probe (`probe`)
-
-| Mode   | What it does                                     |
-|--------|--------------------------------------------------|
-| `fast` | httpx: status code, title, server header         |
-| `deep` | + follow redirects, HTTPS check, tech headers    |
-
-- Gọi `httpx -l subdomains.txt -silent -sc -title -server -json`
-- Parse JSON output từng dòng
-- Fallback: `requests.get()` với timeout nếu thiếu httpx
-- Output: list dict `{url, status, title, server}`
-
----
-
-### Phase 3 — Port Scan (`port`)
-
-| Mode   | nmap flags                    | ~Time     |
-|--------|-------------------------------|-----------|
-| `fast` | `-T4 --top-ports 100 -sV`     | 2–5 min   |
-| `deep` | `-T4 --top-ports 1000 -sV -O` | 5–15 min  |
-
-- Gọi `nmap -oX -` (XML output to stdout)
-- Parse bằng `xml.etree.ElementTree` (stdlib, không cần dep thêm)
-- Output: `{ip: {ports, services, os_guess}}`
+| Tool | Missing? | Fallback |
+|------|----------|----------|
+| subfinder | Dùng source khác | crt.sh + assetfinder + DNS brute |
+| assetfinder | Skip | Các source khác |
+| httpx (Go) | Requests fallback | ThreadPool + requests.get |
+| nmap | Skip port phase | Warn user |
+| ffuf | Requests fallback | Brute-force qua requests |
+| arjun | Skip param phase | Warn user |
+| whatweb | Skip, dùng headers/body | HTTP header + body analysis |
+| amass | Skip (deep only) | Các source khác |
+| NVD API | Timeout → 0 CVEs | Cache nếu có |
 
 ---
 
-### Phase 4 — CVE Enrichment (`cve`) ⭐
-
-| Mode   | Source                                            |
-|--------|---------------------------------------------------|
-| `fast` | Server header từ probe phase → NVD keyword search |
-| `deep` | service:version đầy đủ từ nmap → NVD API v2       |
-
-- Endpoint: `https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=<service+version>`
-- Rate limit: sleep 0.6s giữa các request (6s nếu không có API key)
-- Cache: `~/.reconrisk/cve_cache.json` (tránh query lại cùng version)
-- Optional: `--nvd-key` để tăng rate limit (50 req/30s)
-
-Output per service:
-```json
-{
-  "service": "nginx", "version": "1.18.0",
-  "cves": [{"id": "CVE-2021-23017", "cvss": 9.8, "description": "..."}]
-}
-```
-
----
-
-### Phase 5 — Risk Score (`risk`) ⭐
-
-Pure computation — không gọi network. Tổng hợp tất cả phase trước, score mỗi host 0–100:
-
-```
-Signal                                  Points
-CRITICAL CVE (CVSS ≥ 9.0)              +40
-HIGH CVE (CVSS 7.0–8.9)                +25
-MEDIUM CVE (CVSS 4.0–6.9)              +10 (max +20)
-Sensitive ports (22, 3306, 5432...)     +15
-Admin/dev ports (8080, 9000...)         +10
-HTTP only, no HTTPS                     +10
-```
-
-```
-Score   Band
-≥ 70    CRITICAL 🔴
-50–69   HIGH     🟠
-30–49   MEDIUM   🟡
-< 30    LOW      🟢
-```
-
-Signature: `score_host(probe_data, port_data, cve_data) → int`
-
----
-
-### Phase 6 — Delta / Diff (`delta`) ⭐
-
-So sánh kết quả scan hiện tại với baseline đã lưu từ lần trước.
-
-**Lần đầu chạy `--compare`:** Lưu `results/<domain>/baseline.json`
-
-**Lần tiếp theo:** So sánh và in ra:
-```
-[NEW]     api.example.com → port 3306 mở  (⚠️ sensitive port)
-[GONE]    old.example.com → host đã offline
-[CHANGED] www.example.com → CVE-2024-1234 xuất hiện (CVSS 9.1)
-[CHANGED] www.example.com → risk score: 35 → 75 (+40)
-```
-
-Logic: plain Python `dict diff` — không cần thư viện thêm.
-
----
-
-### Phase 7 — Terminal Report (`report`)
-
-`rich` colored table, tự động chạy sau bất kỳ phase nào có dữ liệu.
-
-- Columns: Host | Status | Open Ports | Top CVE | Risk Score | Band
-- Sorted by risk score (cao → thấp)
-- Nếu có `--top N`: chỉ hiện N host rủi ro nhất
-- Nếu có `--compare`: thêm section "Changes since last scan"
-- Output file: `results/<domain>/report.json`
-
----
-
-## Graceful Degradation
-
-| External tool | Nếu thiếu |
-|---------------|-----------|
-| `subfinder`   | Dùng `dnspython` brute resolve nhẹ |
-| `assetfinder` | Skip silently, subfinder đủ |
-| `httpx`       | Fallback sang `requests.get()` |
-| `nmap`        | Skip port phase, warn user |
-| `amass`       | Loại khỏi prototype hoàn toàn |
-| NVD API       | Timeout/error → log warning, scoring với 0 CVEs |
-
-> [!NOTE]
-> Mọi subprocess call đều có `try/except FileNotFoundError` để graceful skip.
-
----
-
-## requirements.txt
-
-```
-rich>=13.0
-requests>=2.28
-dnspython>=2.3
-```
-
----
-
-## Timeline (3 ngày)
-
-| Ngày      | Focus                                                          |
-|-----------|----------------------------------------------------------------|
-| **Day 1** | scaffold + `recon.py` CLI + Phase 1 (subdomain) + Phase 2 (probe) |
-| **Day 2** | Phase 3 (port) + Phase 4 (CVE + cache) + Phase 5 (risk)       |
-| **Day 3** | Phase 6 (delta/diff) + Phase 7 (report) + `setup.sh` + README |
-
----
-
-## Verification Commands (Linux)
+## Prerequisites
 
 ```bash
-# Cài Python deps
+# System deps
+sudo apt-get install -y nmap python3 python3-pip golang-go
+
+# Go tools (optional but recommended)
+go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+go install github.com/tomnomnom/assetfinder@latest
+go install github.com/ffuf/ffuf/v2@latest
+
+# Python deps
 pip3 install -r requirements.txt
+pip3 install arjun    # optional
 
-# Test 1: Chỉ subdomain + probe (không cần nmap/NVD)
-python3 recon.py -d scanme.nmap.org --steps subdomain,probe
+# Other tools
+sudo apt install amass whatweb  # optional
 
-# Test 2: Full scan fast mode
+# PATH
+export PATH=$PATH:$(go env GOPATH)/bin
+```
+
+---
+
+## Verification
+
+```bash
+# Test 1: Quick fast scan
 python3 recon.py -d scanme.nmap.org --all --depth fast
 
-# Test 3: Delta — chạy lần 1 (tạo baseline)
-python3 recon.py -d scanme.nmap.org --all --compare
+# Test 2: Interactive mode
+python3 recon.py -d scanme.nmap.org --all --depth fast -i
 
-# Test 4: Delta — chạy lần 2 (thấy diff)
-python3 recon.py -d scanme.nmap.org --all --compare
+# Test 3: Deep scan with real domain
+python3 recon.py -d kenh14.vn --all --depth deep -i
 
-# Expected files sau Test 4:
-# results/scanme.nmap.org/subdomains.txt
-# results/scanme.nmap.org/report.json
-# results/scanme.nmap.org/baseline.json
-# Terminal: rich colored table + "Changes since last scan" section
+# Test 4: Delta comparison (run twice)
+python3 recon.py -d scanme.nmap.org --all --compare
+python3 recon.py -d scanme.nmap.org --all --compare
 ```

@@ -160,6 +160,16 @@ All optional tools have fallbacks — the pipeline runs with whatever is availab
 
 ---
 
-## 📄 License
+## � Documentation
+
+| File | Nội dung |
+|------|----------|
+| [`implementation_plan.md`](../implementation_plan.md) | Architecture, CLI design, resilience, file structure |
+| [`state_machines.md`](../state_machines.md) | Mermaid state diagrams cho tất cả 12 phases |
+| [`phase_reference.md`](../phase_reference.md) | Chi tiết scoring, filter criteria, auto-flag patterns |
+
+---
+
+## �📄 License
 
 MIT

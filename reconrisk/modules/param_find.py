@@ -1,5 +1,5 @@
 """
-Phase 8 — Parameter Discovery (arjun)
+Phase 9 — Parameter Discovery (arjun)
 
 Tìm hidden GET/POST parameters trên alive web hosts.
 Auto-flag dangerous params: SSRF, LFI, RCE, IDOR patterns.
@@ -10,6 +10,7 @@ import os
 import subprocess
 import shutil
 import re
+import tempfile
 
 from rich.console import Console
 
@@ -111,13 +112,25 @@ def _classify_param(param_name):
     return flags
 
 
-def _run_arjun(url, timeout=120):
-    """Run arjun on a single URL."""
+def _run_arjun(url, timeout=60):
+    """
+    Run arjun on a single URL.
+    Uses temp file for JSON output to avoid parsing banner/ANSI junk from stdout.
+    """
+    # Create temp file for JSON output
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, prefix="arjun_"
+        ) as tmp:
+            tmp_path = tmp.name
+    except Exception:
+        return []
+
     try:
         result = subprocess.run(
             [
                 "arjun", "-u", url,
-                "-oJ", "/dev/stdout",
+                "-oJ", tmp_path,
                 "-t", "10",
                 "--stable",
             ],
@@ -125,46 +138,71 @@ def _run_arjun(url, timeout=120):
             text=True,
             timeout=timeout,
         )
-        if result.stdout.strip():
-            try:
-                data = json.loads(result.stdout)
-                # Arjun output format varies by version
-                if isinstance(data, dict):
-                    return data.get(url, data.get("params", []))
-                elif isinstance(data, list):
-                    return data
-            except json.JSONDecodeError:
-                # Parse text output: param1, param2, ...
+
+        # Read params from temp JSON file
+        if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 2:
+            with open(tmp_path, "r") as f:
+                try:
+                    data = json.load(f)
+                except json.JSONDecodeError:
+                    return []
+
+            # Arjun JSON format: [{url: ..., params: [...]}] or {url: [...]}
+            if isinstance(data, list):
+                # v2.2+: [{"url": "...", "params": ["p1", "p2"]}]
                 params = []
-                for line in result.stdout.strip().split("\n"):
-                    line = line.strip()
-                    if line and not line.startswith("["):
-                        params.extend(p.strip() for p in line.split(",") if p.strip())
+                for entry in data:
+                    if isinstance(entry, dict):
+                        params.extend(entry.get("params", []))
+                    elif isinstance(entry, str):
+                        params.append(entry)
                 return params
+            elif isinstance(data, dict):
+                # Older format: {"url": ["param1", "param2"]}
+                for key, val in data.items():
+                    if isinstance(val, list):
+                        return val
+                return []
+
+        return []
+
     except subprocess.TimeoutExpired:
-        console.print(f"    [yellow]⚠ arjun timed out on {url}[/yellow]")
+        console.print(f"    [yellow]⚠ arjun timed out ({timeout}s)[/yellow]")
     except FileNotFoundError:
         pass
+    finally:
+        # Clean up temp file
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except Exception:
+            pass
+
     return []
 
 
-def _scan_single_host(probe, use_arjun, timeout):
+def _scan_single_host(probe, timeout):
     """Find params on a single host."""
     url = probe.get("url", "")
     host = probe.get("host", "")
 
-    params = []
+    raw_params = _run_arjun(url, timeout)
 
-    if use_arjun:
-        raw_params = _run_arjun(url, timeout)
-        for p in raw_params:
-            name = p if isinstance(p, str) else p.get("name", str(p))
-            flags = _classify_param(name)
-            params.append({
-                "name": name,
-                "source": "arjun",
-                "flags": flags,
-            })
+    params = []
+    for p in raw_params:
+        name = p if isinstance(p, str) else p.get("name", str(p))
+        # Skip ANSI/garbage strings
+        if not name or "\x1b" in name or "[" in name or len(name) > 50:
+            continue
+        # Skip if it looks like a log line
+        if name.startswith("*") or name.startswith("Scanning") or "://" in name:
+            continue
+        flags = _classify_param(name)
+        params.append({
+            "name": name,
+            "source": "arjun",
+            "flags": flags,
+        })
 
     return {
         "host": host,
@@ -176,7 +214,7 @@ def _scan_single_host(probe, use_arjun, timeout):
 
 def run_param_find(config, results):
     """
-    Main entry point cho Phase 8.
+    Main entry point cho Phase 9.
     Input: probe data (alive web hosts)
     Returns: list of param results per host
     """
@@ -185,22 +223,42 @@ def run_param_find(config, results):
         console.print("  [yellow]⚠ No alive hosts for param discovery[/yellow]")
         return []
 
-    timeout = config.get("timeout", 120)
-    use_arjun = shutil.which("arjun") is not None
+    # Only scan hosts with useful status (skip 503/5xx)
+    scannable = [
+        p for p in probes
+        if p.get("status", 0) in (200, 201, 301, 302, 307, 401, 403)
+    ]
+    if not scannable:
+        console.print("  [yellow]⚠ No hosts with scannable status[/yellow]")
+        return []
 
+    # Limit hosts: fast=10, deep=25
+    depth = config.get("depth", "fast")
+    max_hosts = 25 if depth == "deep" else 10
+    if len(scannable) > max_hosts:
+        console.print(f"  [dim]Limiting to {max_hosts} hosts (total: {len(scannable)})[/dim]")
+        scannable = scannable[:max_hosts]
+
+    # Per-host timeout: 60s fast, 90s deep
+    timeout = 90 if depth == "deep" else 60
+
+    use_arjun = shutil.which("arjun") is not None
     if not use_arjun:
         console.print("  [yellow]⚠ arjun not found — skipping param discovery[/yellow]")
         console.print("  [dim]Install: pip3 install arjun[/dim]")
         return []
 
-    console.print(f"  [dim]Using arjun on {len(probes)} hosts...[/dim]")
+    console.print(
+        f"  [dim]Using arjun on {len(scannable)} hosts "
+        f"(filtered from {len(probes)} alive, {timeout}s/host)...[/dim]"
+    )
 
     param_results = []
-    for i, probe in enumerate(probes):
+    for i, probe in enumerate(scannable):
         host = probe.get("host", "")
-        console.print(f"  [{i+1}/{len(probes)}] [dim]{host}...[/dim]", end="")
+        console.print(f"  [{i+1}/{len(scannable)}] [dim]{host}...[/dim]", end="")
 
-        result = _scan_single_host(probe, use_arjun, timeout)
+        result = _scan_single_host(probe, timeout)
         param_results.append(result)
 
         if result["params"]:
