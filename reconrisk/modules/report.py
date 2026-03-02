@@ -35,6 +35,12 @@ def _build_report_data(config, results):
 
     if risk_data:
         for item in risk_data:
+            cves = item.get("cves", [])
+            # Count by severity
+            crit_count = sum(1 for c in cves if c.get("cvss", 0) >= 9.0)
+            high_count = sum(1 for c in cves if 7.0 <= c.get("cvss", 0) < 9.0)
+            med_count = sum(1 for c in cves if 4.0 <= c.get("cvss", 0) < 7.0)
+
             host_entry = {
                 "host": item.get("host", ""),
                 "url": item.get("probe", {}).get("url", ""),
@@ -45,18 +51,15 @@ def _build_report_data(config, results):
                     f"{p.get('port', '')}/{p.get('service', '')}"
                     for p in item.get("ports", [])
                 ],
-                "top_cve": "",
-                "cve_count": len(item.get("cves", [])),
+                "cves": cves,
+                "cve_count": len(cves),
+                "cve_critical": crit_count,
+                "cve_high": high_count,
+                "cve_medium": med_count,
                 "score": item.get("score", 0),
                 "band": item.get("band", "LOW"),
                 "emoji": item.get("emoji", "🟢"),
             }
-
-            # Top CVE by CVSS
-            cves = item.get("cves", [])
-            if cves:
-                top = max(cves, key=lambda c: c.get("cvss", 0))
-                host_entry["top_cve"] = f"{top.get('id', '')} ({top.get('cvss', 0)})"
 
             report["hosts"].append(host_entry)
     else:
@@ -70,8 +73,11 @@ def _build_report_data(config, results):
                 "title": probe.get("title", ""),
                 "server": probe.get("server", ""),
                 "ports": [],
-                "top_cve": "",
+                "cves": [],
                 "cve_count": 0,
+                "cve_critical": 0,
+                "cve_high": 0,
+                "cve_medium": 0,
                 "score": 0,
                 "band": "N/A",
                 "emoji": "❓",
@@ -99,10 +105,10 @@ def _print_scan_table(report, top_n=None):
         show_lines=True,
     )
 
-    table.add_column("Host", style="bold white", max_width=35)
+    table.add_column("Host", style="bold white", max_width=30)
     table.add_column("Status", justify="center", width=7)
-    table.add_column("Open Ports", max_width=25)
-    table.add_column("Top CVE", max_width=25)
+    table.add_column("Open Ports", max_width=22)
+    table.add_column("CVEs", justify="center", max_width=18)
     table.add_column("Score", justify="center", width=7)
     table.add_column("Risk", justify="center", width=10)
 
@@ -133,6 +139,16 @@ def _print_scan_table(report, top_n=None):
         if len(ports) > 4:
             ports_str += f" +{len(ports)-4}"
 
+        # CVE summary — show count per severity
+        cve_parts = []
+        if h.get("cve_critical", 0):
+            cve_parts.append(f"[red]{h['cve_critical']}C[/red]")
+        if h.get("cve_high", 0):
+            cve_parts.append(f"[yellow]{h['cve_high']}H[/yellow]")
+        if h.get("cve_medium", 0):
+            cve_parts.append(f"[dim]{h['cve_medium']}M[/dim]")
+        cve_str = " ".join(cve_parts) if cve_parts else "[dim]0[/dim]"
+
         # Score color
         score = h.get("score", 0)
         band = h.get("band", "N/A")
@@ -155,7 +171,7 @@ def _print_scan_table(report, top_n=None):
             h.get("host", ""),
             status_str,
             ports_str,
-            h.get("top_cve", ""),
+            cve_str,
             f"[{score_style}]{score}[/{score_style}]",
             band_str,
         )
@@ -210,6 +226,72 @@ def _print_delta_section(delta_data):
     console.print(table)
 
 
+def _print_cve_detail_table(report):
+    """
+    Print bảng chi tiết CVE cho tất cả hosts.
+    Grouped by host, sorted by CVSS descending.
+    """
+    # Collect all CVEs across hosts
+    all_cves = []
+    for h in report["hosts"]:
+        for cve in h.get("cves", []):
+            all_cves.append({
+                "host": h["host"],
+                **cve,
+            })
+
+    if not all_cves:
+        return
+
+    console.print()
+    console.print(Panel(
+        f"[bold]🛡️  CVE Details — {len(all_cves)} vulnerabilities found[/bold]",
+        border_style="red",
+    ))
+
+    table = Table(
+        border_style="red",
+        show_lines=False,
+        pad_edge=True,
+    )
+    table.add_column("Host", style="bold", max_width=25)
+    table.add_column("CVE ID", style="cyan", width=18)
+    table.add_column("CVSS", justify="center", width=6)
+    table.add_column("Severity", justify="center", width=10)
+    table.add_column("Description", max_width=60)
+
+    # Sort by CVSS desc
+    all_cves.sort(key=lambda c: c.get("cvss", 0), reverse=True)
+
+    for cve in all_cves:
+        cvss = cve.get("cvss", 0)
+        severity = cve.get("severity", "MEDIUM")
+
+        if severity == "CRITICAL":
+            cvss_str = f"[bold red]{cvss}[/bold red]"
+            sev_str = f"[bold red]🔴 {severity}[/bold red]"
+        elif severity == "HIGH":
+            cvss_str = f"[yellow]{cvss}[/yellow]"
+            sev_str = f"[yellow]🟠 {severity}[/yellow]"
+        else:
+            cvss_str = f"[dim]{cvss}[/dim]"
+            sev_str = f"[dim]🟡 {severity}[/dim]"
+
+        desc = cve.get("description", "")[:80]
+        if len(cve.get("description", "")) > 80:
+            desc += "..."
+
+        table.add_row(
+            cve.get("host", ""),
+            cve.get("id", ""),
+            cvss_str,
+            sev_str,
+            desc,
+        )
+
+    console.print(table)
+
+
 def _save_report(report, output_dir):
     """Save report as JSON file."""
     filepath = os.path.join(output_dir, "report.json")
@@ -228,8 +310,11 @@ def run_report(config, results):
     # Build report data
     report = _build_report_data(config, results)
 
-    # Print table
+    # Print main table (hosts overview)
     _print_scan_table(report, top_n=config.get("top_n"))
+
+    # Print CVE detail table
+    _print_cve_detail_table(report)
 
     # Print delta if available
     delta_data = results.get("delta")

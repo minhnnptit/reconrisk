@@ -17,9 +17,14 @@ from rich.text import Text
 
 from modules import PHASES, PHASE_DEPS
 from modules.subdomain import run_subdomain
+from modules.dns_resolve import run_dns_resolve
+from modules.prioritize import run_prioritize
 from modules.http_probe import run_probe
+from modules.tech_detect import run_tech_detect
 from modules.port_scan import run_port_scan
+from modules.web_fuzz import run_web_fuzz
 from modules.cve_lookup import run_cve_lookup
+from modules.param_find import run_param_find
 from modules.risk_score import run_risk_score
 from modules.delta import run_delta
 from modules.report import run_report
@@ -29,9 +34,14 @@ console = Console()
 # ─── Phase runner map ────────────────────────────────────────────────
 PHASE_RUNNERS = {
     "subdomain": run_subdomain,
+    "resolve": run_dns_resolve,
+    "prioritize": run_prioritize,
     "probe": run_probe,
+    "techdetect": run_tech_detect,
     "port": run_port_scan,
+    "fuzz": run_web_fuzz,
     "cve": run_cve_lookup,
+    "paramfind": run_param_find,
     "risk": run_risk_score,
     "delta": run_delta,
     "report": run_report,
@@ -62,7 +72,8 @@ Examples:
         "--steps",
         type=str,
         default=None,
-        help="Comma-separated phases: subdomain,probe,port,cve,risk,delta",
+        help="Comma-separated phases: subdomain,resolve,prioritize,probe,"
+             "techdetect,port,fuzz,cve,paramfind,risk,delta",
     )
     parser.add_argument(
         "--all", action="store_true", dest="run_all", help="Run all phases"

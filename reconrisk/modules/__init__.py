@@ -1,28 +1,38 @@
 """
-ReconRisk — Modular Recon Phases
+ReconRisk v2 — Modular Recon Phases (12 phases)
 
-Mỗi phase là một module độc lập, được đăng ký trong PHASES list.
-Pipeline sẽ chạy các phase theo thứ tự này.
+Pipeline: subdomain → resolve → prioritize → probe → techdetect
+          → port → fuzz → cve → paramfind → risk → delta → report
 """
 
 # Phase registry — thứ tự chạy mặc định
 PHASES = [
-    "subdomain",
-    "probe",
-    "port",
-    "cve",
-    "risk",
-    "delta",
-    "report",
+    "subdomain",    # amass + subfinder + assetfinder + crt.sh
+    "resolve",      # DNS resolve → IPs, CNAME detect
+    "prioritize",   # Score + filter subdomains
+    "probe",        # HTTP alive check
+    "techdetect",   # whatweb + header/body patterns
+    "port",         # nmap on unique IPs
+    "fuzz",         # ffuf directory scan
+    "cve",          # NVD API (service + tech stack)
+    "paramfind",    # arjun parameter discovery
+    "risk",         # scoring 0-100
+    "delta",        # baseline diff
+    "report",       # terminal + JSON
 ]
 
-# Phase dependencies — mỗi phase cần data từ phase nào
+# Phase dependencies
 PHASE_DEPS = {
-    "subdomain": [],
-    "probe": ["subdomain"],
-    "port": ["subdomain"],
-    "cve": ["probe", "port"],
-    "risk": ["probe", "port", "cve"],
-    "delta": ["risk"],
-    "report": [],  # report luôn chạy nếu có bất kỳ data nào
+    "subdomain":  [],
+    "resolve":    ["subdomain"],
+    "prioritize": ["resolve"],
+    "probe":      ["prioritize"],
+    "techdetect": ["probe"],
+    "port":       ["resolve"],
+    "fuzz":       ["probe"],
+    "cve":        ["port", "techdetect"],
+    "paramfind":  ["probe"],
+    "risk":       ["probe", "port", "cve"],
+    "delta":      ["risk"],
+    "report":     [],
 }

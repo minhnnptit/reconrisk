@@ -129,9 +129,25 @@ def run_port_scan(config, results):
     timeout = config["timeout"]
     depth = config["depth"]
 
-    # Lấy targets
-    subdomains = results.get("subdomain", [])
-    if not subdomains:
+    # Get targets — prefer unique IPs from resolve phase
+    dns_data = results.get("resolve", {})
+    if dns_data and dns_data.get("unique_ips"):
+        targets_list = dns_data["unique_ips"]
+        console.print(f"  [dim]Scanning {len(targets_list)} unique IPs from DNS resolve[/dim]")
+    else:
+        # Fallback: use subdomains directly
+        subdomains = results.get("subdomain", [])
+        if isinstance(subdomains, list) and subdomains:
+            # Handle prioritized list (list of dicts)
+            if isinstance(subdomains[0], dict):
+                targets_list = [s["subdomain"] for s in subdomains]
+            else:
+                targets_list = subdomains
+        else:
+            console.print("  [yellow]⚠ No targets for port scan[/yellow]")
+            return {}
+
+    if not targets_list:
         console.print("  [yellow]⚠ No targets for port scan[/yellow]")
         return {}
 
@@ -142,9 +158,9 @@ def run_port_scan(config, results):
         return {}
 
     # Giới hạn số target cho prototype
-    targets = subdomains[:50]  # Max 50 hosts
-    if len(subdomains) > 50:
-        console.print(f"  [yellow]⚠ Limiting to 50 targets (total: {len(subdomains)})[/yellow]")
+    targets = targets_list[:50]  # Max 50 hosts
+    if len(targets_list) > 50:
+        console.print(f"  [yellow]⚠ Limiting to 50 targets (total: {len(targets_list)})[/yellow]")
 
     cmd = _build_nmap_cmd(targets, depth, timeout)
     console.print(f"  [dim]Running: {' '.join(cmd[:6])}... ({len(targets)} targets)[/dim]")

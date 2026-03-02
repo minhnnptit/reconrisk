@@ -222,11 +222,17 @@ def run_probe(config, results):
     timeout = config["timeout"]
     threads = config["threads"]
 
-    # Lấy subdomains từ Phase 1
-    subdomains = results.get("subdomain", [])
-    if not subdomains:
-        console.print("  [yellow]⚠ No subdomains to probe (subdomain phase not run?)[/yellow]")
+    # Lấy subdomains — prioritized list hoặc raw strings
+    raw = results.get("prioritize") or results.get("subdomain", [])
+    if not raw:
+        console.print("  [yellow]⚠ No subdomains to probe[/yellow]")
         return []
+
+    # Handle prioritized list (list of dicts) or plain list
+    if raw and isinstance(raw[0], dict):
+        subdomains = [s["subdomain"] for s in raw]
+    else:
+        subdomains = list(raw)
 
     console.print(f"  [dim]Probing {len(subdomains)} subdomains...[/dim]")
 

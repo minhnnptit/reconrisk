@@ -50,10 +50,11 @@ def _cache_key(service, version):
     return hashlib.md5(raw.encode()).hexdigest()
 
 
-def _query_nvd(keyword, nvd_key=None, max_results=10):
+def _query_nvd(keyword, nvd_key=None, max_results=50):
     """
     Query NVD API v2 cho keyword.
-    Returns list of CVE dicts.
+    Returns list of CVE dicts, sorted by CVSS descending.
+    Lọc bỏ CVSS < 4.0 (noise).
     """
     params = {
         "keywordSearch": keyword,
@@ -104,13 +105,16 @@ def _query_nvd(keyword, nvd_key=None, max_results=10):
                     desc = d.get("value", "")[:200]
                     break
 
-            if cve_id:
+            if cve_id and cvss >= 4.0:
                 cves.append({
                     "id": cve_id,
                     "cvss": cvss,
+                    "severity": "CRITICAL" if cvss >= 9.0 else "HIGH" if cvss >= 7.0 else "MEDIUM",
                     "description": desc,
                 })
 
+        # Sort by CVSS descending — critical first
+        cves.sort(key=lambda c: c["cvss"], reverse=True)
         return cves
 
     except req.exceptions.Timeout:

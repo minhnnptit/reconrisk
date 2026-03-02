@@ -1,8 +1,8 @@
 """
-Phase 5 — Risk Score
+Phase 10 — Risk Score (v2)
 
 Pure computation — không gọi network.
-Score mỗi host 0–100 dựa trên CVE, ports, HTTPS.
+Score mỗi host 0–100 dựa trên CVE, ports, HTTPS, fuzz, params, tech.
 
 State Machine:
   CollectHostData → ScoreHosts (loop per host) → SortByScore → Return
@@ -22,12 +22,18 @@ SCORE_MEDIUM_CVE = 10     # CVSS 4.0-6.9 (max +20)
 SCORE_SENSITIVE_PORT = 15
 SCORE_ADMIN_PORT = 10
 SCORE_HTTP_ONLY = 10
+SCORE_CONFIG_LEAK = 20    # .git, .env found by fuzz
+SCORE_ADMIN_PANEL = 10    # admin panel found by fuzz
+SCORE_BACKUP_FILE = 15    # backup found by fuzz
+SCORE_DANGER_PARAM = 15   # SSRF/LFI/RCE param
+SCORE_DEBUG_PARAM = 10    # debug/admin param
+SCORE_TAKEOVER = 40       # subdomain takeover
 
 # Max scores để tránh inflate
 MAX_MEDIUM_CVE_SCORE = 20
 
 
-def _score_host(host, probe_data, port_data, cve_data):
+def _score_host(host, probe_data, port_data, cve_data, fuzz_data, param_data, dns_data):
     """
     Tính risk score cho một host.
     Returns: (score: int, breakdown: dict)
@@ -40,6 +46,12 @@ def _score_host(host, probe_data, port_data, cve_data):
         "sensitive_ports": [],
         "admin_ports": [],
         "http_only": False,
+        "config_leak": False,
+        "admin_panel": False,
+        "backup_found": False,
+        "danger_params": 0,
+        "debug_params": 0,
+        "takeover": False,
     }
 
     # ── CVE scoring ──────────────────────────────────────────────
@@ -59,7 +71,6 @@ def _score_host(host, probe_data, port_data, cve_data):
                 medium_score += SCORE_MEDIUM_CVE
                 breakdown["medium_cves"] += 1
 
-    # Cap medium CVE score
     score += min(medium_score, MAX_MEDIUM_CVE_SCORE)
 
     # ── Port scoring ─────────────────────────────────────────────
@@ -90,6 +101,44 @@ def _score_host(host, probe_data, port_data, cve_data):
                 breakdown["http_only"] = True
             break
 
+    # ── Fuzz scoring (NEW) ───────────────────────────────────────
+    for fuzz_result in fuzz_data:
+        if fuzz_result.get("host") != host:
+            continue
+        for finding in fuzz_result.get("findings", []):
+            for flag in finding.get("flags", []):
+                category = flag.get("category", "")
+                if category == "config_leak" and not breakdown["config_leak"]:
+                    score += SCORE_CONFIG_LEAK
+                    breakdown["config_leak"] = True
+                elif category == "admin_panel" and not breakdown["admin_panel"]:
+                    score += SCORE_ADMIN_PANEL
+                    breakdown["admin_panel"] = True
+                elif category == "backup_file" and not breakdown["backup_found"]:
+                    score += SCORE_BACKUP_FILE
+                    breakdown["backup_found"] = True
+
+    # ── Param scoring (NEW) ──────────────────────────────────────
+    for param_result in param_data:
+        if param_result.get("host") != host:
+            continue
+        for param in param_result.get("params", []):
+            for flag in param.get("flags", []):
+                category = flag.get("category", "")
+                if category in ("ssrf_redirect", "lfi_rfi", "rce"):
+                    score += min(SCORE_DANGER_PARAM, 15)  # cap at 15
+                    breakdown["danger_params"] += 1
+                elif category == "debug_admin":
+                    score += min(SCORE_DEBUG_PARAM, 10)   # cap at 10
+                    breakdown["debug_params"] += 1
+
+    # ── Subdomain takeover (NEW) ─────────────────────────────────
+    if dns_data:
+        for t in dns_data.get("takeovers", []):
+            if t.get("subdomain") == host:
+                score += SCORE_TAKEOVER
+                breakdown["takeover"] = True
+
     # Clamp to 0-100
     score = max(0, min(100, score))
 
@@ -110,19 +159,22 @@ def _get_band(score):
 
 def run_risk_score(config, results):
     """
-    Main entry point cho Phase 5.
-    Input: probe, port, cve data
+    Main entry point cho Phase 10.
+    Input: probe, port, cve, fuzz, param, dns data
     Returns: list of {host, score, band, emoji, breakdown, probe, ports, cves}
     """
     probe_data = results.get("probe", [])
     port_data = results.get("port", {})
     cve_data = results.get("cve", {})
+    fuzz_data = results.get("fuzz", []) or []
+    param_data = results.get("paramfind", []) or []
+    dns_data = results.get("resolve", {}) or {}
 
     if not probe_data and not port_data:
         console.print("  [yellow]⚠ No probe or port data for scoring[/yellow]")
         return []
 
-    # Collect tất cả unique hosts
+    # Collect all unique hosts
     hosts = set()
     for probe in probe_data:
         hosts.add(probe.get("host", ""))
@@ -135,7 +187,10 @@ def run_risk_score(config, results):
 
     scored_hosts = []
     for host in hosts:
-        score, breakdown = _score_host(host, probe_data, port_data, cve_data)
+        score, breakdown = _score_host(
+            host, probe_data, port_data, cve_data,
+            fuzz_data, param_data, dns_data,
+        )
         band, emoji = _get_band(score)
 
         # Collect host-specific data
@@ -161,13 +216,27 @@ def run_risk_score(config, results):
     scored_hosts.sort(key=lambda x: x["score"], reverse=True)
 
     # Print summary
-    for h in scored_hosts[:10]:  # Show top 10
+    for h in scored_hosts[:10]:
+        bd = h["breakdown"]
+        extras = []
+        if bd.get("config_leak"):
+            extras.append("🔴leak")
+        if bd.get("admin_panel"):
+            extras.append("🔴admin")
+        if bd.get("takeover"):
+            extras.append("🔴takeover")
+        if bd.get("danger_params"):
+            extras.append(f"⚠{bd['danger_params']}params")
+
+        extra_str = f"  {' '.join(extras)}" if extras else ""
+
         console.print(
             f"    {h['emoji']} [{h['band'].lower()}]{h['host']}[/{h['band'].lower()}]"
             f"  score={h['score']}  "
-            f"[dim]({h['breakdown']['critical_cves']}C "
-            f"{h['breakdown']['high_cves']}H "
-            f"{h['breakdown']['medium_cves']}M)[/dim]"
+            f"[dim]({bd['critical_cves']}C "
+            f"{bd['high_cves']}H "
+            f"{bd['medium_cves']}M)[/dim]"
+            f"{extra_str}"
         )
 
     if len(scored_hosts) > 10:
