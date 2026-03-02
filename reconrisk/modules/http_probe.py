@@ -1,16 +1,21 @@
 """
-Phase 2 — HTTP Probe
+Phase 2 — HTTP Probe (Optimized)
 
-State Machine:
-  CheckInput → CheckHttpx → UseHttpx / UseFallback → BuildProbeData → Return
-  
-  - httpx: chạy subprocess, parse JSON lines
-  - Fallback: requests.get() với thread pool
+Strategy (priority order):
+  1. ProjectDiscovery httpx (Go binary) — nhanh nhất, feature đầy đủ
+  2. Python httpx library (async, HTTP/2) — tốt hơn requests
+  3. requests library — fallback cuối cùng
+
+Binary conflict: Kali có Python `httpx` CLI khác với Go `httpx`.
+Fix: tìm Go binary ở ~/go/bin/httpx trực tiếp.
 """
 
 import json
+import os
+import re
 import subprocess
 import shutil
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -19,41 +24,62 @@ from rich.console import Console
 console = Console()
 
 
-def _check_tool(name):
-    """Kiểm tra tool có trong PATH không."""
-    return shutil.which(name) is not None
-
-
-def _is_projectdiscovery_httpx():
+def _find_go_httpx():
     """
-    Verify httpx là ProjectDiscovery httpx (Go binary),
-    không phải Python httpx package mà Kali có sẵn.
+    Tìm ProjectDiscovery httpx binary.
+    Returns: full path hoặc None
+    
+    Priority:
+      1. ~/go/bin/httpx
+      2. $(go env GOPATH)/bin/httpx
+      3. httpx trong PATH (verify là ProjectDiscovery version)
     """
+    # Check ~/go/bin/httpx
+    home_go = os.path.join(str(Path.home()), "go", "bin", "httpx")
+    if os.path.isfile(home_go) and os.access(home_go, os.X_OK):
+        return home_go
+
+    # Check GOPATH/bin/httpx
     try:
         result = subprocess.run(
-            ["httpx", "-version"],
-            capture_output=True,
-            text=True,
-            timeout=5,
+            ["go", "env", "GOPATH"],
+            capture_output=True, text=True, timeout=5,
         )
-        output = (result.stdout + result.stderr).lower()
-        # ProjectDiscovery httpx in ra "projectdiscovery" hoặc version format "x.x.x"
-        return "projectdiscovery" in output or "current version" in output
+        gopath = result.stdout.strip()
+        if gopath:
+            gopath_httpx = os.path.join(gopath, "bin", "httpx")
+            if os.path.isfile(gopath_httpx) and os.access(gopath_httpx, os.X_OK):
+                return gopath_httpx
     except Exception:
-        return False
+        pass
+
+    # Check httpx trong PATH — verify là ProjectDiscovery
+    httpx_path = shutil.which("httpx")
+    if httpx_path:
+        try:
+            result = subprocess.run(
+                [httpx_path, "-version"],
+                capture_output=True, text=True, timeout=5,
+            )
+            output = (result.stdout + result.stderr).lower()
+            if "projectdiscovery" in output or "current version" in output:
+                return httpx_path
+        except Exception:
+            pass
+
+    return None
 
 
-def _run_httpx(subdomains, depth, timeout):
+def _run_go_httpx(httpx_path, subdomains, depth, timeout):
     """
-    Chạy httpx subprocess, parse JSON output.
+    Chạy ProjectDiscovery httpx (Go binary).
     Returns list of probe dicts.
     """
-    # httpx đọc từ stdin
     input_data = "\n".join(subdomains)
 
-    cmd = ["httpx", "-silent", "-sc", "-title", "-server", "-json"]
+    cmd = [httpx_path, "-silent", "-sc", "-title", "-server", "-json"]
     if depth == "deep":
-        cmd.extend(["-follow-redirects", "-tls-probe"])
+        cmd.extend(["-follow-redirects", "-tls-probe", "-tech-detect"])
 
     try:
         result = subprocess.run(
@@ -90,14 +116,15 @@ def _run_httpx(subdomains, depth, timeout):
         console.print(f"  [yellow]⚠ httpx timed out after {timeout}s[/yellow]")
         return []
     except FileNotFoundError:
-        console.print("  [yellow]⚠ httpx not found[/yellow]")
+        console.print(f"  [yellow]⚠ httpx binary not found at {httpx_path}[/yellow]")
         return []
 
 
 def _probe_single(subdomain, timeout_sec=10):
     """
-    Fallback: probe một subdomain bằng requests.
+    Probe một subdomain bằng requests.
     Thử HTTPS trước, rồi HTTP.
+    Collect headers bổ sung cho security analysis.
     """
     for scheme in ["https", "http"]:
         url = f"{scheme}://{subdomain}"
@@ -106,29 +133,45 @@ def _probe_single(subdomain, timeout_sec=10):
                 url,
                 timeout=timeout_sec,
                 allow_redirects=True,
-                verify=False,  # Chấp nhận self-signed cert
+                verify=False,
                 headers={"User-Agent": "ReconRisk/1.0"},
             )
             # Trích title từ HTML
             title = ""
             if resp.text:
-                import re
                 match = re.search(r"<title[^>]*>(.*?)</title>", resp.text, re.IGNORECASE | re.DOTALL)
                 if match:
                     title = match.group(1).strip()[:100]
 
+            # Collect security-relevant headers
+            headers = resp.headers
+            tech = []
+            for header in ["X-Powered-By", "X-AspNet-Version", "X-Generator"]:
+                val = headers.get(header, "")
+                if val:
+                    tech.append(val)
+
             return {
-                "url": url,
+                "url": resp.url,  # URL sau redirect
                 "host": subdomain,
                 "status": resp.status_code,
                 "title": title,
-                "server": resp.headers.get("Server", ""),
-                "tech": [],
-                "tls": {"enabled": scheme == "https"},
+                "server": headers.get("Server", ""),
+                "tech": tech,
+                "tls": {
+                    "enabled": scheme == "https",
+                    "redirected_to_https": resp.url.startswith("https://") and scheme == "http",
+                },
                 "content_length": len(resp.content),
+                "headers": {
+                    "x_frame_options": headers.get("X-Frame-Options", ""),
+                    "content_security_policy": headers.get("Content-Security-Policy", ""),
+                    "strict_transport_security": headers.get("Strict-Transport-Security", ""),
+                },
             }
         except requests.exceptions.SSLError:
-            # HTTPS failed, try HTTP
+            continue
+        except requests.exceptions.ConnectionError:
             continue
         except requests.exceptions.RequestException:
             continue
@@ -143,7 +186,7 @@ def _fallback_probe(subdomains, threads, timeout):
     probes = []
     timeout_per_req = min(10, timeout // max(len(subdomains), 1))
 
-    console.print(f"  [dim]Probing {len(subdomains)} hosts with requests (threads={threads})...[/dim]")
+    console.print(f"  [dim]Probing {len(subdomains)} hosts (threads={threads})...[/dim]")
 
     with ThreadPoolExecutor(max_workers=threads) as executor:
         futures = {
@@ -156,10 +199,12 @@ def _fallback_probe(subdomains, threads, timeout):
                 result = future.result()
                 if result:
                     probes.append(result)
-                    status_color = "green" if result["status"] < 400 else "yellow"
+                    status = result["status"]
+                    status_color = "green" if status < 400 else "yellow" if status < 500 else "red"
+                    tls_icon = "🔒" if result["tls"].get("enabled") else "⚠️"
                     console.print(
-                        f"    [{status_color}]{result['status']}[/{status_color}] "
-                        f"{result['url']}  [dim]{result['title'][:50]}[/dim]"
+                        f"    [{status_color}]{status}[/{status_color}] "
+                        f"{tls_icon} {result['url']}  [dim]{result['title'][:50]}[/dim]"
                     )
             except Exception:
                 pass
@@ -185,19 +230,20 @@ def run_probe(config, results):
 
     console.print(f"  [dim]Probing {len(subdomains)} subdomains...[/dim]")
 
-    has_httpx = _check_tool("httpx") and _is_projectdiscovery_httpx()
+    # Strategy 1: Tìm ProjectDiscovery httpx Go binary
+    go_httpx = _find_go_httpx()
 
-    if has_httpx:
-        console.print(f"  [dim]Using httpx ({depth} mode)...[/dim]")
-        probes = _run_httpx(subdomains, depth, timeout)
+    if go_httpx:
+        console.print(f"  [dim]Using ProjectDiscovery httpx ({depth} mode) → {go_httpx}[/dim]")
+        probes = _run_go_httpx(go_httpx, subdomains, depth, timeout)
         if probes:
             console.print(f"  [green]✓ httpx found {len(probes)} alive hosts[/green]")
             return probes
-        console.print("  [yellow]⚠ httpx returned no results, falling back to requests[/yellow]")
-    elif _check_tool("httpx"):
-        console.print("  [yellow]⚠ httpx found but is NOT ProjectDiscovery httpx — using requests fallback[/yellow]")
+        console.print("  [yellow]⚠ httpx returned no results, falling back...[/yellow]")
+    else:
+        console.print("  [dim]ProjectDiscovery httpx not found, using requests probe[/dim]")
 
-    # Fallback
+    # Strategy 2: requests fallback (with thread pool)
     probes = _fallback_probe(subdomains, threads, timeout)
     console.print(f"  [green]✓ Found {len(probes)} alive hosts[/green]")
 

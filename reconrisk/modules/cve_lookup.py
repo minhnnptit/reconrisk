@@ -127,7 +127,14 @@ def _query_nvd(keyword, nvd_key=None, max_results=10):
 def _extract_services(config, results):
     """
     Trích xuất danh sách (service, version) từ probe + port data.
+    Lọc bỏ noise: tcpwrapped, unknown, services không có version.
     """
+    # Noise filter — skip các service không có ý nghĩa cho CVE lookup
+    NOISE_SERVICES = {
+        "tcpwrapped", "unknown", "filtered", "closed",
+        "", "none", "general", "unrecognized",
+    }
+
     services = []
     seen = set()
 
@@ -135,19 +142,26 @@ def _extract_services(config, results):
     probe_data = results.get("probe", [])
     for probe in probe_data:
         server = probe.get("server", "").strip()
-        if server and server not in seen:
-            seen.add(server)
-            # Parse "nginx/1.18.0" → ("nginx", "1.18.0")
-            parts = server.split("/", 1)
-            service = parts[0].strip()
-            version = parts[1].strip() if len(parts) > 1 else ""
-            if service:
-                services.append({
-                    "service": service,
-                    "version": version,
-                    "source": "probe",
-                    "host": probe.get("host", ""),
-                })
+        if not server or server.lower() in NOISE_SERVICES:
+            continue
+
+        # Parse "Apache/2.4.7 (Ubuntu)" → ("Apache", "2.4.7")
+        # Strip OS info trong ngoặc
+        import re
+        clean = re.sub(r"\s*\(.*?\)\s*", " ", server).strip()
+        parts = clean.split("/", 1)
+        service = parts[0].strip()
+        version = parts[1].strip() if len(parts) > 1 else ""
+
+        key = f"{service}:{version}".lower()
+        if key not in seen and service and version:
+            seen.add(key)
+            services.append({
+                "service": service,
+                "version": version,
+                "source": "probe",
+                "host": probe.get("host", ""),
+            })
 
     # Từ port scan data (nmap service detection)
     port_data = results.get("port", {})
@@ -155,13 +169,21 @@ def _extract_services(config, results):
         for port_info in host_data.get("ports", []):
             product = port_info.get("product", "")
             version = port_info.get("version", "")
-            service = port_info.get("service", "")
+            service_name = port_info.get("service", "")
 
-            key = f"{product or service}:{version}".lower()
-            if key not in seen and (product or service):
+            # Skip noise
+            if (product or service_name).lower() in NOISE_SERVICES:
+                continue
+
+            # Skip nếu không có version — query sẽ trả về noise
+            if not version:
+                continue
+
+            key = f"{product or service_name}:{version}".lower()
+            if key not in seen and (product or service_name):
                 seen.add(key)
                 services.append({
-                    "service": product or service,
+                    "service": product or service_name,
                     "version": version,
                     "source": "nmap",
                     "host": hostname,
